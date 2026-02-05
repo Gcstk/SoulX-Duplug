@@ -6,14 +6,14 @@ class TurnSession:
         self.engine = engine
         self.last_state = None
 
-        # session 生命周期管理
+        # session lifecycle management
         now = time.time()
         self.created_ts = now
         self.last_active_ts = now
 
     def touch(self):
         """
-        被 server 调用，用于 session 保活 / GC
+        Called by server, used for session keep-alive / GC
         """
         self.last_active_ts = time.time()
 
@@ -21,14 +21,14 @@ class TurnSession:
         """
         audio: np.ndarray(float32)
         """
-        # 每次收到音频，都算活跃
+        # Consider active every time audio is received
         self.touch()
 
         result = self.engine.process(audio)
         self.last_state = result["state"]
         return result
 
-        # # 只在状态变化时上报
+        # # Report only when state changes
         # if result["state"] != self.last_state:
         #     self.last_state = result["state"]
         #     return result

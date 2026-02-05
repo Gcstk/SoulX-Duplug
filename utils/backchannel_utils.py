@@ -1,17 +1,18 @@
 def check_backchannel(s: str) -> bool:
     """
-    判断文本是否为空、无意义，或属于中英文 backchannel （无需回复）
+    The model itself has backchannel judgment capabilities; this is a fallback function.
+    It determines if the text is empty, meaningless, or belongs to Chinese/English backchannels.
     """
 
     s = s.strip().replace(",", "").replace(".", "").replace("，", "").replace("。", "")
 
-    # 完全空白
+    # Completely empty
     if not s:
         return True
 
-    # === 中英文 backchannel ===
+    # === Chinese and English backchannels ===
     BACKCHANNEL = {
-        # 中文
+        # Chinese
         "嗯",
         "嗯嗯",
         "啊",
@@ -35,7 +36,7 @@ def check_backchannel(s: str) -> bool:
         "嗯哼",
         "哼",
         "嘿",
-        # 英文
+        # English
         "ok",
         "okay",
         "yeah",
@@ -61,20 +62,20 @@ def check_backchannel(s: str) -> bool:
         "yes",
     }
 
-    # 统一为小写判断英文
+    # Unify to lowercase for English judgement
     if s.lower() in BACKCHANNEL:
         return True
 
-    # 有些 backchannel 在 ASR 会被识别成长词，这里处理短句模式
-    if len(s) <= 3 and any(
+    # Some backchannels might be recognized as long words in ASR, handling short phrase patterns here
+    if len(s) <= 5 and any(
         key in s.lower() for key in ["ok", "mm", "hmm", "uh", "yes", "yeah"]
     ):
         return True
     if len(s) <= 2 and any(ch in s for ch in ["嗯", "啊", "哦"]):
         return True
 
-    # 纯标点
-    if all(ch in ".,!?！？。；;…" for ch in s):
+    # Pure punctuation
+    if all(ch in ".,!?;。，！？；…" for ch in s):
         return True
 
     return False
@@ -82,11 +83,13 @@ def check_backchannel(s: str) -> bool:
 
 def remove_leading_backchannel(text: str) -> str:
     """
-    从前向后扫描字符串，移除开头的语气词（如“嗯”、“啊”）及标点符号，直到遇到第一个非语气词字符。
+    Scans the string from the beginning, removing leading backchannel and punctuation,
+    until the first non-backchannel character is encountered.
+    A fallback function to prevent edge cases when the model loops infinitely.
     """
-    # 常见的中文语气词单字
+    # Common Chinese backchannel characters
     backchannel_chars = {"嗯", "啊", "哦", "噢", "呃", "哎", "哼", "嘿"}
-    # 常见的标点符号和空白
+    # Common punctuation and whitespace
     punctuation_chars = {
         " ",
         ",",

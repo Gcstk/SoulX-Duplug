@@ -1,8 +1,3 @@
-import requests
-import base64
-import json
-import io
-import wave
 import numpy as np
 import torch, torchaudio
 import re
@@ -24,7 +19,7 @@ class ParaformerASR:
                 disable_update=True,
             )
         except Exception as e:
-            print("加载Paraformer模型失败:", e)
+            print("Failed to load Paraformer model:", e)
             self.asr_pipeline = pipeline(
                 task=Tasks.auto_speech_recognition,
                 model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -42,7 +37,7 @@ class ParaformerASR:
         try:
             result = self.asr_pipeline(audio_chunk)[0]["text"].strip()
         except Exception as e:
-            print("ASR调用失败:", e)
+            print("ASR recognition failed:", e)
             result = ""
         return result
 
@@ -107,6 +102,6 @@ class SensevoiceASR:
             ).strip()
             result = self.clean_sensevoice_text(result)
         except Exception as e:
-            print("ASR调用失败:", e)
+            print("ASR recognition failed:", e)
             result = ""
         return result

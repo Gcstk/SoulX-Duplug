@@ -13,14 +13,14 @@ from service.engine import TurnTakingEngine
 from service.session import TurnSession
 from service.model import load_turn_model
 
-SESSION_TTL_SEC = 60  # 60 秒无音频则回收
-GC_INTERVAL_SEC = 10  # session GC 周期
+SESSION_TTL_SEC = 60  # Recycle if no audio for 60 seconds
+GC_INTERVAL_SEC = 10  # Session GC interval
 
-# 全局状态
+# Global state
 sessions: Dict[str, TurnSession] = {}
 
 
-# FastAPI 生命周期
+# FastAPI Lifecycle
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[TurnTaking] loading model ...")
@@ -77,7 +77,7 @@ async def turn_ws(ws: WebSocket):
                 print(f"[TurnTaking] new session {session_id}")
 
             session = sessions[session_id]
-            session.touch()  # 更新时间戳
+            session.touch()  # Update timestamp
 
             try:
                 audio = np.frombuffer(base64.b64decode(data["audio"]), dtype=np.float32)
