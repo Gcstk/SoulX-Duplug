@@ -97,6 +97,19 @@ git clone https://huggingface.co/Soul-AILab/SoulX-Duplug-0.6B pretrained_models
 ```
 
 
+### Configuration Details
+
+In `config/config.yaml`:
+
+- For the `infer_config.asr` field:
+    - For Chinese, we recommend using `model_name: paraformer`
+    - For English, set it to `model_name: sensevoice`, `language: en`
+    - For bilingual scenarios, use `model_name: sensevoice`, `language: auto`
+
+- The `max_wait_num` parameter is used as a fallback mechanism to handle potential misclassification of *incomplete* cases. It defines the number of chunks to wait without additional user speech before the assistant starts responding.
+
+- The `far_field_threshold` parameter sets the threshold for filtering far-field audio in noisy environments.
+
 
 ### Basic Usage
 We provide a streaming inference server for SoulX-Duplug. Start the server:
@@ -137,7 +150,7 @@ We implemented a demo full-duplex spoken dialogue system based on SoulX-Duplug. 
 
 ## 📌 TODOs
 - [x] Publish the technical report.
-- [ ] Release evaluation scripts.
+- [x] Release evaluation scripts.
 
 
 ## 🔖 Citation
