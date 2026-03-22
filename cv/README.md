@@ -104,17 +104,17 @@ python cv/eval_easy_turn_ws.py \
 
 Optional arguments:
 
-- `--chunk-samples`: streaming chunk size, default `2560`
-- `--sample-rate`: target sample rate, default `16000`
-- `--post-roll-ms`: trailing silence appended after each sample, default `2000`
-- `--ws-timeout`: WebSocket timeout in seconds, default `5`
-- `--log-level`: evaluation log verbosity, one of `quiet`, `basic`, `debug`
-- `--quiet`: deprecated alias for `--log-level quiet`
+- `--chunk-samples`: number of samples sent per WS request. Default `2560`, matching the service chunk size in `config/config.yaml`.
+- `--sample-rate`: target sample rate after waveform loading and resampling. Default `16000`.
+- `--post-roll-ms`: trailing silence appended after each wav to give the turn detector time to emit final states. Default `2000`.
+- `--ws-timeout`: timeout in seconds for each WS request/response round trip. Default `5`. Increase this if first-chunk inference is slow.
+- `--log-level`: evaluator verbosity. `quiet` prints total sample count, per-sample final result, final report paths, and errors. `basic` adds sample start/progress logs. `debug` adds per-chunk and per-request logs.
+- `--quiet`: deprecated alias for `--log-level quiet`.
 
 Verbosity meaning:
 
-- `quiet`: only final report paths and errors
-- `basic`: sample-level progress and errors
+- `quiet`: total sample count, per-sample final result, final report paths, and errors
+- `basic`: sample start/progress plus per-sample final result and errors
 - `debug`: per-chunk evaluation logs and per-request WS logs
 
 Example against a remote service:

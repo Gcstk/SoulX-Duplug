@@ -117,6 +117,15 @@ We provide a streaming inference server for SoulX-Duplug. Start the server:
 bash run.sh
 ```
 
+Optional server log control:
+```bash
+TURN_SERVER_LOG_LEVEL=quiet bash run.sh
+```
+
+- `TURN_SERVER_LOG_LEVEL=quiet`: only errors
+- `TURN_SERVER_LOG_LEVEL=basic`: startup, shutdown, and connection lifecycle
+- `TURN_SERVER_LOG_LEVEL=debug`: includes per-session and per-chunk request logs
+
 For usage (see [example_client.py](https://github.com/Soul-AILab/SoulX-Duplug/blob/main/example_client.py) for reference), streamingly send your audio query (in chunks) to the server, and the server will return its prediction of the current dialogue state in a `dict`:
 
 - Format:
@@ -129,8 +138,31 @@ For usage (see [example_client.py](https://github.com/Soul-AILab/SoulX-Duplug/bl
             "text": ,           # (optional) asr result of user's turn
             "asr_segment": ,    # (optional) asr result of current chunk
             "asr_buffer": ,     # (optional) asr result of last 3.2s
+            "debug": {          # (always present) internal evaluation fields
+                "internal_state": ,
+                "eval_label_hint": ,
+                "cascade_text": ,
+                "delta_text": ,
+            },
         },
         "ts": time.time(),      # timestamp
+    }
+    ```
+
+- Reset a session immediately:
+    ```python
+    {
+        "type": "reset",
+        "session_id": ,
+    }
+    ```
+    The server returns:
+    ```python
+    {
+        "type": "session_reset",
+        "session_id": ,
+        "ok": True,
+        "ts": time.time(),
     }
     ```
 
@@ -141,6 +173,14 @@ For usage (see [example_client.py](https://github.com/Soul-AILab/SoulX-Duplug/bl
 - **"speak"** indicates that up to the current chunk, the user is judged to have stopped speaking and the utterance is semantically complete, meaning the system can take the turn. In this case, `"asr_segment"` returns the ASR result of the current chunk, `"asr_buffer"` returns the ASR result of the accumulated audio over the past 3.2 seconds, and `"text"` returns the complete transcription of the user’s utterance for this turn. 
 
 - **"blank"** indicates that the current unprocessed streaming input does not yet fill a full chunk; the server has cached the input and is waiting for the next query.
+
+- The `debug` fields are mainly intended for evaluation:
+    - `internal_state`: raw internal state such as `<|user_complete|>` or `<|user_incomplete|>`
+    - `eval_label_hint`: mapped evaluation label, one of `WAIT`, `BACKCHANNEL`, `COMPLETE`, `INCOMPLETE`, or `null`
+    - `cascade_text`: current accumulated ASR text used inside the model
+    - `delta_text`: current chunk's incremental ASR text
+
+For batch evaluation against Easy-Turn, see [cv/README.md](/Users/geotk/workspace/audio/SoulX-Duplug/cv/README.md).
 
 
 ### Dialogue System

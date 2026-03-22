@@ -46,6 +46,12 @@ def should_log(log_level: str, required_level: str) -> bool:
     return LOG_LEVEL_RANK[log_level] >= LOG_LEVEL_RANK[required_level]
 
 
+def shorten_text(text: str, limit: int = 48) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
 @dataclass
 class SampleRecord:
     key: str
@@ -583,6 +589,17 @@ def write_reports(rows: list[dict], report_root: Path):
     return csv_path, json_path
 
 
+def print_sample_result(index: int, total: int, row: dict):
+    hyp_preview = shorten_text(row["hyp_text"])
+    print(
+        f"[{index}/{total}] key={row['key']} "
+        f"ref={row['ref_label']} pred={row['pred_label']} "
+        f"ok={int(bool(row['label_correct']))} "
+        f"cer={row['cer']:.4f} wer={row['wer']:.4f} "
+        f"hyp={hyp_preview}"
+    )
+
+
 def main():
     args = parse_args()
     if args.quiet:
@@ -592,6 +609,9 @@ def main():
 
     records = load_dataset_records(dataset_root)
     rows = []
+    print(
+        f"Loaded {len(records)} samples from {dataset_root} with log_level={args.log_level}"
+    )
 
     with TurnWSClient(
         args.ws_url,
@@ -601,15 +621,16 @@ def main():
         for index, record in enumerate(records, start=1):
             if should_log(args.log_level, "basic"):
                 print(f"[{index}/{len(records)}] {record.key} -> {record.label}")
-            rows.append(
-                evaluate_sample(
-                    client=client,
-                    record=record,
-                    chunk_samples=args.chunk_samples,
-                    sample_rate=args.sample_rate,
-                    post_roll_ms=args.post_roll_ms,
-                )
+            row = evaluate_sample(
+                client=client,
+                record=record,
+                chunk_samples=args.chunk_samples,
+                sample_rate=args.sample_rate,
+                post_roll_ms=args.post_roll_ms,
             )
+            rows.append(row)
+            if args.log_level in {"quiet", "basic"}:
+                print_sample_result(index, len(records), row)
 
     csv_path, json_path = write_reports(rows, report_dir)
     print(f"Saved sample report to {csv_path}")
