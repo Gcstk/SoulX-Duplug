@@ -65,8 +65,27 @@ async def turn_ws(ws: WebSocket):
         while True:
             raw = await ws.receive_text()
             data = json.loads(raw)
+            message_type = data.get("type")
 
-            if data.get("type") != "audio":
+            if message_type == "reset":
+                session_id = data.get("session_id")
+                if session_id in sessions:
+                    del sessions[session_id]
+                    print(f"[TurnTaking] reset session {session_id}")
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "session_reset",
+                            "session_id": session_id,
+                            "ok": True,
+                            "ts": time.time(),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                continue
+
+            if message_type != "audio":
                 continue
 
             session_id = data["session_id"]

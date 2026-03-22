@@ -14,6 +14,7 @@ from utils.backchannel_utils import check_backchannel, remove_leading_backchanne
 
 from config.config import RunConfig
 from model.model import State_Prediction_Model
+from service.debug_state import build_debug_payload
 from transformers import WhisperFeatureExtractor
 
 
@@ -218,13 +219,7 @@ class TurnModel:
         assert audio_chunk.dtype == np.float32
         # print(audio_chunk.shape)
         self.buffer = np.concatenate([self.buffer, audio_chunk])
-        delta_text = ""
-        asr_buffer = ""
-        predicted_state = {
-            "state": "blank",
-            "asr_segment": delta_text,
-            "asr_buffer": asr_buffer,
-        }
+        predicted_state = self._build_prediction_state("blank")
 
         start_prediction, process_chunk, audio_back, audio_ahead = self.get_chunk()
 
@@ -234,6 +229,34 @@ class TurnModel:
             self._log(f"[Timing] Total chunk: {time.time() - t_start:.4f}s\n\n")
 
         return predicted_state
+
+    def _build_prediction_state(
+        self,
+        public_state,
+        internal_state=None,
+        delta_text="",
+        asr_buffer="",
+        text=None,
+        cascade_text=None,
+    ):
+        if cascade_text is None and isinstance(self.past_state, dict):
+            cascade_text = self.past_state.get("cascade_text", "")
+
+        prediction = {
+            "state": public_state,
+            "asr_segment": delta_text or "",
+            "asr_buffer": asr_buffer or "",
+            "debug": build_debug_payload(
+                internal_state=internal_state,
+                cascade_text=cascade_text or "",
+                delta_text=delta_text or "",
+            ),
+        }
+
+        if text is not None:
+            prediction["text"] = text
+
+        return prediction
 
     def state_predict(self, process_chunk, audio_back, audio_ahead):
         state, delta_text, asr_buffer = self.infer(
@@ -248,11 +271,7 @@ class TurnModel:
             self._log(f"Far-field speech detected: {self.get_rms(process_chunk)}")
             # process_chunk = np.zeros_like(process_chunk)
             self.reset()
-            return {
-                "state": "idle",
-                "asr_segment": "",
-                "asr_buffer": "",
-            }
+            return self._build_prediction_state("idle", internal_state=state)
 
         self.past_state["history_len"] += 1
 
@@ -271,14 +290,16 @@ class TurnModel:
                         segment = self.cascade_asr.recognize(
                             self.buffer_for_asr, self.sampling_rate
                         )
+                        predicted_state = self._build_prediction_state(
+                            "speak",
+                            internal_state=state,
+                            delta_text=delta_text,
+                            asr_buffer=asr_buffer,
+                            text=segment,
+                        )
                         # self.clear_turn()
                         self.reset()
-                        return {
-                            "state": "speak",
-                            "text": segment,
-                            "asr_segment": delta_text,
-                            "asr_buffer": asr_buffer,
-                        }
+                        return predicted_state
 
             if (
                 self.past_state["history_len"] > 200
@@ -320,11 +341,12 @@ class TurnModel:
                 self.buffer_for_asr = np.concatenate(
                     [self.buffer_for_asr, process_chunk]
                 )
-            return {
-                "state": "nonidle",
-                "asr_segment": delta_text,
-                "asr_buffer": asr_buffer,
-            }
+            return self._build_prediction_state(
+                "nonidle",
+                internal_state=state,
+                delta_text=delta_text,
+                asr_buffer=asr_buffer,
+            )
 
         elif state == "<|user_backchannel|>":
             # self._log("Backchannel detected")
@@ -342,14 +364,16 @@ class TurnModel:
                 segment = self.cascade_asr.recognize(
                     self.buffer_for_asr, self.sampling_rate
                 )
+                predicted_state = self._build_prediction_state(
+                    "speak",
+                    internal_state=state,
+                    delta_text=delta_text,
+                    asr_buffer=asr_buffer,
+                    text=segment,
+                )
                 # self.clear_turn()
                 self.reset()
-                return {
-                    "state": "speak",
-                    "text": segment,
-                    "asr_segment": delta_text,
-                    "asr_buffer": asr_buffer,
-                }
+                return predicted_state
             # self.clear_turn()
             self.reset()
 
@@ -364,11 +388,12 @@ class TurnModel:
             self._log("Unknown state")
             self.reset()
 
-        return {
-            "state": "idle",
-            "asr_segment": delta_text,
-            "asr_buffer": asr_buffer,
-        }
+        return self._build_prediction_state(
+            "idle",
+            internal_state=state,
+            delta_text=delta_text,
+            asr_buffer=asr_buffer,
+        )
 
     @torch.no_grad()
     def infer(self, audio_chunk, audio_back, audio_ahead):
