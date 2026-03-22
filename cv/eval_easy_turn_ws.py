@@ -39,6 +39,11 @@ LABEL_PRIORITY = {
     "BACKCHANNEL": 1,
     "WAIT": 0,
 }
+LOG_LEVEL_RANK = {"quiet": 0, "basic": 1, "debug": 2}
+
+
+def should_log(log_level: str, required_level: str) -> bool:
+    return LOG_LEVEL_RANK[log_level] >= LOG_LEVEL_RANK[required_level]
 
 
 @dataclass
@@ -52,10 +57,10 @@ class SampleRecord:
 
 
 class TurnWSClient:
-    def __init__(self, server_url: str, timeout: float = 5.0, verbose: bool = True):
+    def __init__(self, server_url: str, timeout: float = 5.0, log_level: str = "basic"):
         self.server_url = server_url
         self.timeout = timeout
-        self.verbose = verbose
+        self.log_level = log_level
         self._ws = None
 
     def __enter__(self):
@@ -70,7 +75,7 @@ class TurnWSClient:
             return
         from websockets.sync.client import connect
 
-        if self.verbose:
+        if should_log(self.log_level, "debug"):
             print(
                 f"[WS] connect url={self.server_url} open_timeout={self.timeout}s recv_timeout={self.timeout}s"
             )
@@ -84,7 +89,7 @@ class TurnWSClient:
     def close(self):
         if self._ws is None:
             return
-        if self.verbose:
+        if should_log(self.log_level, "debug"):
             print("[WS] close connection")
         with suppress(Exception):
             self._ws.close()
@@ -96,14 +101,14 @@ class TurnWSClient:
 
         try:
             send_start = time.time()
-            if self.verbose:
+            if should_log(self.log_level, "debug"):
                 print(
                     f"[WS] send type={payload.get('type')} session_id={payload.get('session_id')}"
                 )
             self._ws.send(json.dumps(payload, ensure_ascii=False))
             raw_response = self._ws.recv(timeout=response_timeout or self.timeout)
             response = json.loads(raw_response)
-            if self.verbose:
+            if should_log(self.log_level, "debug"):
                 state = response.get("state", {})
                 debug = state.get("debug", {})
                 print(
@@ -119,7 +124,7 @@ class TurnWSClient:
                 )
             return response
         except TimeoutError as exc:
-            if self.verbose:
+            if should_log(self.log_level, "basic"):
                 print(
                     f"[WS] recv timeout type={payload.get('type')} session_id={payload.get('session_id')} timeout={response_timeout or self.timeout}s"
                 )
@@ -128,7 +133,7 @@ class TurnWSClient:
                 f"for type={payload.get('type')} session_id={payload.get('session_id')}"
             ) from exc
         except Exception as exc:
-            if self.verbose:
+            if should_log(self.log_level, "basic"):
                 print(
                     f"[WS] request failed type={payload.get('type')} session_id={payload.get('session_id')} error={exc!r}; reconnecting"
                 )
@@ -137,7 +142,7 @@ class TurnWSClient:
             self._ws.send(json.dumps(payload, ensure_ascii=False))
             raw_response = self._ws.recv(timeout=response_timeout or self.timeout)
             response = json.loads(raw_response)
-            if self.verbose:
+            if should_log(self.log_level, "debug"):
                 state = response.get("state", {})
                 debug = state.get("debug", {})
                 print(
@@ -176,9 +181,15 @@ def parse_args():
     parser.add_argument("--post-roll-ms", type=int, default=2000)
     parser.add_argument("--ws-timeout", type=float, default=5.0)
     parser.add_argument(
+        "--log-level",
+        choices=["quiet", "basic", "debug"],
+        default="basic",
+        help="Evaluation logging verbosity. Default: basic.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Reduce per-chunk WebSocket logs.",
+        help="Deprecated alias for --log-level quiet.",
     )
     return parser.parse_args()
 
@@ -296,12 +307,40 @@ def reduce_predicted_label(events: list[dict]) -> str:
     return best_label
 
 
-def extract_final_hypothesis(events: list[dict]) -> str:
+def _event_hint(event: dict) -> str | None:
+    return event.get("state", {}).get("debug", {}).get("eval_label_hint")
+
+
+def collect_segment_summaries(events: list[dict]) -> list[dict]:
+    segments = []
+    current_label = None
+
+    for event in events:
+        state = event.get("state", {})
+        public_state = state.get("state")
+        hint = _event_hint(event)
+
+        if hint and (hint != "WAIT" or current_label is None):
+            current_label = hint
+
+        if public_state == "speak":
+            segment_label = current_label or hint or "WAIT"
+            segments.append(
+                {
+                    "label": segment_label,
+                    "text": (state.get("text") or "").strip(),
+                }
+            )
+            current_label = None
+
+    return segments
+
+
+def last_non_empty_residual(events: list[dict]) -> str:
     candidates = []
     for event in events:
         state = event.get("state", {})
         debug = state.get("debug", {})
-        candidates.append(state.get("text") or "")
         candidates.append(debug.get("cascade_text") or "")
         candidates.append(state.get("asr_buffer") or "")
 
@@ -311,12 +350,59 @@ def extract_final_hypothesis(events: list[dict]) -> str:
     return ""
 
 
+def extract_final_hypothesis(events: list[dict]) -> str:
+    segments = collect_segment_summaries(events)
+    pieces = []
+
+    for segment in segments:
+        text = segment["text"]
+        if text and (not pieces or pieces[-1] != text):
+            pieces.append(text)
+
+    residual = last_non_empty_residual(events)
+    if residual and (not pieces or residual not in pieces[-1]):
+        pieces.append(residual)
+
+    if pieces:
+        return "".join(pieces).strip()
+    return residual
+
+
 def public_final_state(events: list[dict]) -> str:
     for event in reversed(events):
         state = event.get("state", {}).get("state")
         if state:
             return state
     return ""
+
+
+def first_segment_label(events: list[dict]) -> str:
+    segments = collect_segment_summaries(events)
+    if segments:
+        return segments[0]["label"]
+    return "WAIT"
+
+
+def last_segment_label(events: list[dict]) -> str:
+    segments = collect_segment_summaries(events)
+    if segments:
+        return segments[-1]["label"]
+    return "WAIT"
+
+
+def fallback_stream_label(events: list[dict]) -> str:
+    last_hint = None
+    last_non_wait = None
+
+    for event in events:
+        hint = _event_hint(event)
+        if hint is None:
+            continue
+        last_hint = hint
+        if hint != "WAIT":
+            last_non_wait = hint
+
+    return last_non_wait or last_hint or "WAIT"
 
 
 def evaluate_sample(
@@ -330,43 +416,54 @@ def evaluate_sample(
     audio = load_audio_as_float32(record.wav_path, sample_rate)
     events = []
     total_chunks = math.ceil(len(audio) / chunk_samples) if len(audio) else 0
-    print(
-        f"[Eval] start key={record.key} subset={record.subset} label={record.label} "
-        f"samples={len(audio)} chunks={total_chunks} wav={record.wav_path}"
-    )
+    log_level = getattr(client, "log_level", "basic")
+    if should_log(log_level, "basic"):
+        print(
+            f"[Eval] start key={record.key} subset={record.subset} label={record.label} "
+            f"samples={len(audio)} chunks={total_chunks} wav={record.wav_path}"
+        )
 
     try:
         for chunk_index, chunk in enumerate(iter_audio_chunks(audio, chunk_samples), start=1):
-            print(
-                f"[Eval] chunk key={record.key} index={chunk_index}/{max(total_chunks, 1)} samples={len(chunk)}"
-            )
+            if should_log(log_level, "debug"):
+                print(
+                    f"[Eval] chunk key={record.key} index={chunk_index}/{max(total_chunks, 1)} samples={len(chunk)}"
+                )
             events.append(client.process(session_id, chunk))
 
         post_roll_samples = int(sample_rate * post_roll_ms / 1000)
         if post_roll_samples > 0:
             silence = np.zeros(post_roll_samples, dtype=np.float32)
             total_post_chunks = math.ceil(post_roll_samples / chunk_samples)
-            print(
-                f"[Eval] post-roll key={record.key} ms={post_roll_ms} samples={post_roll_samples} chunks={total_post_chunks}"
-            )
+            if should_log(log_level, "debug"):
+                print(
+                    f"[Eval] post-roll key={record.key} ms={post_roll_ms} samples={post_roll_samples} chunks={total_post_chunks}"
+                )
             for chunk_index, chunk in enumerate(
                 iter_audio_chunks(silence, chunk_samples), start=1
             ):
-                print(
-                    f"[Eval] post-roll chunk key={record.key} index={chunk_index}/{max(total_post_chunks, 1)} samples={len(chunk)}"
-                )
+                if should_log(log_level, "debug"):
+                    print(
+                        f"[Eval] post-roll chunk key={record.key} index={chunk_index}/{max(total_post_chunks, 1)} samples={len(chunk)}"
+                    )
                 events.append(client.process(session_id, chunk))
     finally:
-        print(f"[Eval] reset session key={record.key} session_id={session_id}")
+        if should_log(log_level, "debug"):
+            print(f"[Eval] reset session key={record.key} session_id={session_id}")
         try:
             client.reset(session_id)
         except Exception as exc:
-            print(
-                f"[Eval] reset failed key={record.key} session_id={session_id} error={exc!r}"
-            )
+            if should_log(log_level, "basic"):
+                print(
+                    f"[Eval] reset failed key={record.key} session_id={session_id} error={exc!r}"
+                )
 
+    segments = collect_segment_summaries(events)
     hypothesis = extract_final_hypothesis(events)
-    prediction = reduce_predicted_label(events)
+    fallback_prediction = fallback_stream_label(events)
+    prediction = segments[-1]["label"] if segments else fallback_prediction
+    first_prediction = segments[0]["label"] if segments else fallback_prediction
+    any_positive_prediction = reduce_predicted_label(events)
     ref_char_tokens = char_tokens(record.transcript)
     hyp_char_tokens = char_tokens(hypothesis)
     ref_word_tokens = word_tokens(record.transcript)
@@ -379,12 +476,16 @@ def evaluate_sample(
         "ref_label": record.label,
         "pred_label": prediction,
         "label_correct": prediction == record.label,
+        "first_segment_label": first_prediction,
+        "last_segment_label": prediction,
+        "any_positive_label": any_positive_prediction,
         "ref_text": record.transcript,
         "hyp_text": normalize_text(hypothesis),
         "cer": compute_cer(record.transcript, hypothesis),
         "wer": compute_wer(record.transcript, hypothesis),
         "public_final_state": public_final_state(events),
         "seen_internal_states": "|".join(collect_seen_internal_states(events)),
+        "segment_labels": "|".join(segment["label"] for segment in segments),
         "char_edits": levenshtein_distance(ref_char_tokens, hyp_char_tokens),
         "char_ref_len": len(ref_char_tokens),
         "word_edits": levenshtein_distance(ref_word_tokens, hyp_word_tokens),
@@ -461,12 +562,16 @@ def write_reports(rows: list[dict], report_root: Path):
                 "ref_label",
                 "pred_label",
                 "label_correct",
+                "first_segment_label",
+                "last_segment_label",
+                "any_positive_label",
                 "ref_text",
                 "hyp_text",
                 "cer",
                 "wer",
                 "public_final_state",
                 "seen_internal_states",
+                "segment_labels",
             ],
         )
         writer.writeheader()
@@ -480,6 +585,8 @@ def write_reports(rows: list[dict], report_root: Path):
 
 def main():
     args = parse_args()
+    if args.quiet:
+        args.log_level = "quiet"
     dataset_root = args.dataset_root.resolve()
     report_dir = (args.report_dir / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
 
@@ -489,10 +596,11 @@ def main():
     with TurnWSClient(
         args.ws_url,
         timeout=args.ws_timeout,
-        verbose=not args.quiet,
+        log_level=args.log_level,
     ) as client:
         for index, record in enumerate(records, start=1):
-            print(f"[{index}/{len(records)}] {record.key} -> {record.label}")
+            if should_log(args.log_level, "basic"):
+                print(f"[{index}/{len(records)}] {record.key} -> {record.label}")
             rows.append(
                 evaluate_sample(
                     client=client,

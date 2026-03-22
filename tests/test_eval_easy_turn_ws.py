@@ -5,8 +5,11 @@ import numpy as np
 from cv.eval_easy_turn_ws import (
     SampleRecord,
     build_confusion_matrix,
+    collect_segment_summaries,
     evaluate_sample,
     extract_final_hypothesis,
+    fallback_stream_label,
+    last_segment_label,
     load_dataset_records,
     reduce_predicted_label,
     summarize_rows,
@@ -72,6 +75,84 @@ def test_reduce_predicted_label_and_final_hypothesis():
 
     assert reduce_predicted_label(events) == "COMPLETE"
     assert extract_final_hypothesis(events) == "你好吗"
+
+
+def test_segment_summary_and_concat_hypothesis():
+    events = [
+        {
+            "state": {
+                "state": "speak",
+                "text": "我也会拿那个泥巴做些小蛋糕小饼干。",
+                "debug": {
+                    "internal_state": "<|user_complete|>",
+                    "eval_label_hint": "COMPLETE",
+                    "cascade_text": "我也会拿那个泥巴做些小蛋糕小饼干",
+                    "delta_text": "",
+                },
+            }
+        },
+        {
+            "state": {
+                "state": "idle",
+                "debug": {
+                    "internal_state": "<|user_incomplete|>",
+                    "eval_label_hint": "INCOMPLETE",
+                    "cascade_text": "之类的",
+                    "delta_text": "",
+                },
+            }
+        },
+        {
+            "state": {
+                "state": "speak",
+                "text": "之类的。",
+                "debug": {
+                    "internal_state": "<|user_idle|>",
+                    "eval_label_hint": "WAIT",
+                    "cascade_text": "之类的",
+                    "delta_text": "",
+                },
+            }
+        },
+    ]
+
+    assert collect_segment_summaries(events) == [
+        {"label": "COMPLETE", "text": "我也会拿那个泥巴做些小蛋糕小饼干。"},
+        {"label": "INCOMPLETE", "text": "之类的。"},
+    ]
+    assert last_segment_label(events) == "INCOMPLETE"
+    assert reduce_predicted_label(events) == "COMPLETE"
+    assert extract_final_hypothesis(events) == "我也会拿那个泥巴做些小蛋糕小饼干。之类的。"
+
+
+def test_fallback_stream_label_without_terminal_segment():
+    events = [
+        {
+            "state": {
+                "state": "idle",
+                "debug": {
+                    "internal_state": "<|user_backchannel|>",
+                    "eval_label_hint": "BACKCHANNEL",
+                    "cascade_text": "",
+                    "delta_text": "",
+                },
+            }
+        },
+        {
+            "state": {
+                "state": "idle",
+                "debug": {
+                    "internal_state": "<|user_idle|>",
+                    "eval_label_hint": "WAIT",
+                    "cascade_text": "",
+                    "delta_text": "",
+                },
+            }
+        },
+    ]
+
+    assert collect_segment_summaries(events) == []
+    assert fallback_stream_label(events) == "BACKCHANNEL"
 
 
 def test_evaluate_sample_resets_session(monkeypatch):
@@ -153,6 +234,9 @@ def test_evaluate_sample_resets_session(monkeypatch):
 
     assert row["pred_label"] == "COMPLETE"
     assert row["label_correct"] is True
+    assert row["first_segment_label"] == "COMPLETE"
+    assert row["last_segment_label"] == "COMPLETE"
+    assert row["any_positive_label"] == "COMPLETE"
     assert row["public_final_state"] == "speak"
     assert row["hyp_text"] == "你好吗"
     assert client.reset_session_id is not None
@@ -167,12 +251,16 @@ def test_summary_and_confusion_matrix():
             "ref_label": "COMPLETE",
             "pred_label": "COMPLETE",
             "label_correct": True,
+            "first_segment_label": "COMPLETE",
+            "last_segment_label": "COMPLETE",
+            "any_positive_label": "COMPLETE",
             "ref_text": "你好",
             "hyp_text": "你好",
             "cer": 0.0,
             "wer": 0.0,
             "public_final_state": "speak",
             "seen_internal_states": "<|user_complete|>",
+            "segment_labels": "COMPLETE",
             "char_edits": 0,
             "char_ref_len": 2,
             "word_edits": 0,
@@ -185,12 +273,16 @@ def test_summary_and_confusion_matrix():
             "ref_label": "WAIT",
             "pred_label": "BACKCHANNEL",
             "label_correct": False,
+            "first_segment_label": "WAIT",
+            "last_segment_label": "BACKCHANNEL",
+            "any_positive_label": "BACKCHANNEL",
             "ref_text": "",
             "hyp_text": "",
             "cer": 0.0,
             "wer": 0.0,
             "public_final_state": "idle",
             "seen_internal_states": "<|user_backchannel|>",
+            "segment_labels": "BACKCHANNEL",
             "char_edits": 0,
             "char_ref_len": 0,
             "word_edits": 0,

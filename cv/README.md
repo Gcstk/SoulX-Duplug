@@ -108,6 +108,14 @@ Optional arguments:
 - `--sample-rate`: target sample rate, default `16000`
 - `--post-roll-ms`: trailing silence appended after each sample, default `2000`
 - `--ws-timeout`: WebSocket timeout in seconds, default `5`
+- `--log-level`: evaluation log verbosity, one of `quiet`, `basic`, `debug`
+- `--quiet`: deprecated alias for `--log-level quiet`
+
+Verbosity meaning:
+
+- `quiet`: only final report paths and errors
+- `basic`: sample-level progress and errors
+- `debug`: per-chunk evaluation logs and per-request WS logs
 
 Example against a remote service:
 
@@ -116,6 +124,36 @@ python cv/eval_easy_turn_ws.py \
   --dataset-root /data/liuke_data/datasets/asr_datasets/Easy_turn/Easy-Turn-Testset/testset \
   --ws-url ws://10.0.0.8:8000/turn \
   --report-dir cv/reports
+```
+
+To reduce evaluator output:
+
+```bash
+python cv/eval_easy_turn_ws.py \
+  --dataset-root /data/liuke_data/datasets/asr_datasets/Easy_turn/Easy-Turn-Testset/testset \
+  --ws-url ws://127.0.0.1:8000/turn \
+  --report-dir cv/reports \
+  --log-level quiet
+```
+
+## Server Log Control
+
+The `/turn` service also supports configurable logging through an environment variable:
+
+```bash
+export TURN_SERVER_LOG_LEVEL=quiet
+```
+
+Supported values:
+
+- `quiet`: only errors
+- `basic`: startup, shutdown, connection lifecycle
+- `debug`: includes per-session and per-chunk request logs
+
+Example:
+
+```bash
+TURN_SERVER_LOG_LEVEL=quiet bash run.sh
 ```
 
 ## Label Evaluation Rule
@@ -130,7 +168,20 @@ Per-event mapping:
 - `<|user_idle|>` -> `WAIT`
 - `<|user_nonidle|>` -> ignored for final label reduction
 
-Per-sample reduction priority:
+Primary per-sample label:
+
+- the evaluator groups events into terminal segments using `public == "speak"`
+- each segment gets the latest non-`WAIT` label seen before that terminal point
+- `pred_label` uses the **last segment label** of the whole wav
+- if no terminal segment is produced, fallback is the last valid stream hint, preferring non-`WAIT`
+
+Additional diagnostic labels are also written to `samples.csv`:
+
+- `first_segment_label`
+- `last_segment_label`
+- `any_positive_label`
+
+`any_positive_label` keeps the older loose rule:
 
 1. `COMPLETE`
 2. `INCOMPLETE`
@@ -141,12 +192,11 @@ Per-sample reduction priority:
 
 The evaluator uses the final hypothesis for CER and WER, not chunk-level `asr_segment`.
 
-Final hypothesis priority:
+Final hypothesis rule:
 
-1. last non-empty `state.text`
-2. last non-empty `state.debug.cascade_text`
-3. last non-empty `state.asr_buffer`
-4. empty string
+1. concatenate all non-empty `state.text` values from `public == "speak"` events in order
+2. if the tail still has unresolved text, append the last non-empty `state.debug.cascade_text` or `state.asr_buffer`
+3. if no terminal text exists at all, fallback to the last non-empty residual text
 
 Text normalization:
 
@@ -179,12 +229,16 @@ Generated files:
 - `ref_label`
 - `pred_label`
 - `label_correct`
+- `first_segment_label`
+- `last_segment_label`
+- `any_positive_label`
 - `ref_text`
 - `hyp_text`
 - `cer`
 - `wer`
 - `public_final_state`
 - `seen_internal_states`
+- `segment_labels`
 
 `summary.json` contains:
 

@@ -19,22 +19,36 @@ GC_INTERVAL_SEC = 10  # Session GC interval
 # Global state
 sessions: Dict[str, TurnSession] = {}
 
+LOG_LEVEL_RANK = {"quiet": 0, "basic": 1, "debug": 2}
+SERVER_LOG_LEVEL = os.getenv("TURN_SERVER_LOG_LEVEL", "basic").strip().lower()
+if SERVER_LOG_LEVEL not in LOG_LEVEL_RANK:
+    SERVER_LOG_LEVEL = "basic"
+
+
+def should_log(required_level: str) -> bool:
+    return LOG_LEVEL_RANK[SERVER_LOG_LEVEL] >= LOG_LEVEL_RANK[required_level]
+
+
+def log(message: str, level: str = "basic"):
+    if should_log(level):
+        print(message)
+
 
 # FastAPI Lifecycle
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[TurnTaking] loading model ...")
+    log("[TurnTaking] loading model ...", "basic")
     app.state.model = load_turn_model(
         config_path=os.path.join(os.path.dirname(__file__), "config/config.yaml")
     )
-    print("[TurnTaking] model loaded")
+    log("[TurnTaking] model loaded", "basic")
 
     gc_task = asyncio.create_task(session_gc_loop())
 
     yield
 
     gc_task.cancel()
-    print("[TurnTaking] shutdown")
+    log("[TurnTaking] shutdown", "basic")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -52,7 +66,7 @@ async def session_gc_loop():
                 expired.append(sid)
 
         for sid in expired:
-            print(f"[TurnTaking] GC session {sid}")
+            log(f"[TurnTaking] GC session {sid}", "debug")
             del sessions[sid]
 
         await asyncio.sleep(GC_INTERVAL_SEC)
@@ -61,7 +75,7 @@ async def session_gc_loop():
 @app.websocket("/turn")
 async def turn_ws(ws: WebSocket):
     await ws.accept()
-    print("[TurnTaking] websocket connected")
+    log("[TurnTaking] websocket connected", "basic")
 
     try:
         while True:
@@ -73,7 +87,7 @@ async def turn_ws(ws: WebSocket):
                 session_id = data.get("session_id")
                 if session_id in sessions:
                     del sessions[session_id]
-                    print(f"[TurnTaking] reset session {session_id}")
+                    log(f"[TurnTaking] reset session {session_id}", "debug")
                 await ws.send_text(
                     json.dumps(
                         {
@@ -95,7 +109,7 @@ async def turn_ws(ws: WebSocket):
             if session_id not in sessions:
                 engine = TurnTakingEngine(model=ws.app.state.model)
                 sessions[session_id] = TurnSession(engine)
-                print(f"[TurnTaking] new session {session_id}")
+                log(f"[TurnTaking] new session {session_id}", "debug")
 
             session = sessions[session_id]
             session.touch()  # Update timestamp
@@ -107,8 +121,10 @@ async def turn_ws(ws: WebSocket):
 
             chunk_len = len(audio)
             t_start = time.time()
-            print(
+            log(
                 f"[TurnTaking] recv audio session={session_id} samples={chunk_len} processing={getattr(session, 'processing', False)}"
+                ,
+                "debug",
             )
             state = session.feed_audio(audio)
             elapsed = time.time() - t_start
@@ -116,7 +132,7 @@ async def turn_ws(ws: WebSocket):
             if state is not None:
                 public_state = state.get("state")
                 debug = state.get("debug", {})
-                print(
+                log(
                     "[TurnTaking] send state "
                     f"session={session_id} public={public_state} "
                     f"internal={debug.get('internal_state')} "
@@ -125,6 +141,8 @@ async def turn_ws(ws: WebSocket):
                     f"cascade={debug.get('cascade_text', '')[:60]} "
                     f"text={state.get('text', '')[:60]} "
                     f"elapsed={elapsed:.3f}s"
+                    ,
+                    "debug",
                 )
                 await ws.send_text(
                     json.dumps(
@@ -139,7 +157,7 @@ async def turn_ws(ws: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        print("[TurnTaking] websocket disconnected")
+        log("[TurnTaking] websocket disconnected", "basic")
 
     except Exception as e:
         print(f"[TurnTaking] websocket error: {e}")
