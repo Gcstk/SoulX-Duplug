@@ -46,6 +46,8 @@ async def session_gc_loop():
         expired = []
 
         for sid, sess in sessions.items():
+            if getattr(sess, "processing", False):
+                continue
             if now - sess.last_active_ts > SESSION_TTL_SEC:
                 expired.append(sid)
 
@@ -103,9 +105,27 @@ async def turn_ws(ws: WebSocket):
             except Exception:
                 continue
 
+            chunk_len = len(audio)
+            t_start = time.time()
+            print(
+                f"[TurnTaking] recv audio session={session_id} samples={chunk_len} processing={getattr(session, 'processing', False)}"
+            )
             state = session.feed_audio(audio)
+            elapsed = time.time() - t_start
 
             if state is not None:
+                public_state = state.get("state")
+                debug = state.get("debug", {})
+                print(
+                    "[TurnTaking] send state "
+                    f"session={session_id} public={public_state} "
+                    f"internal={debug.get('internal_state')} "
+                    f"hint={debug.get('eval_label_hint')} "
+                    f"delta={debug.get('delta_text', '')[:60]} "
+                    f"cascade={debug.get('cascade_text', '')[:60]} "
+                    f"text={state.get('text', '')[:60]} "
+                    f"elapsed={elapsed:.3f}s"
+                )
                 await ws.send_text(
                     json.dumps(
                         {

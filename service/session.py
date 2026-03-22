@@ -5,6 +5,7 @@ class TurnSession:
     def __init__(self, engine):
         self.engine = engine
         self.last_state = None
+        self.processing = False
 
         # session lifecycle management
         now = time.time()
@@ -23,10 +24,14 @@ class TurnSession:
         """
         # Consider active every time audio is received
         self.touch()
-
-        result = self.engine.process(audio)
-        self.last_state = result["state"]
-        return result
+        self.processing = True
+        try:
+            result = self.engine.process(audio)
+            self.last_state = result["state"]
+            self.touch()
+            return result
+        finally:
+            self.processing = False
 
         # # Report only when state changes
         # if result["state"] != self.last_state:

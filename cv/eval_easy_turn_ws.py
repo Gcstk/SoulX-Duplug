@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import sys
+import time
 import uuid
 from collections import defaultdict
 from contextlib import suppress
@@ -51,9 +52,10 @@ class SampleRecord:
 
 
 class TurnWSClient:
-    def __init__(self, server_url: str, timeout: float = 5.0):
+    def __init__(self, server_url: str, timeout: float = 5.0, verbose: bool = True):
         self.server_url = server_url
         self.timeout = timeout
+        self.verbose = verbose
         self._ws = None
 
     def __enter__(self):
@@ -68,6 +70,10 @@ class TurnWSClient:
             return
         from websockets.sync.client import connect
 
+        if self.verbose:
+            print(
+                f"[WS] connect url={self.server_url} open_timeout={self.timeout}s recv_timeout={self.timeout}s"
+            )
         self._ws = connect(
             self.server_url,
             open_timeout=self.timeout,
@@ -78,22 +84,73 @@ class TurnWSClient:
     def close(self):
         if self._ws is None:
             return
+        if self.verbose:
+            print("[WS] close connection")
         with suppress(Exception):
             self._ws.close()
         self._ws = None
 
-    def _send_json(self, payload: dict) -> dict:
+    def _send_json(self, payload: dict, response_timeout: float | None = None) -> dict:
         if self._ws is None:
             self.connect()
 
         try:
+            send_start = time.time()
+            if self.verbose:
+                print(
+                    f"[WS] send type={payload.get('type')} session_id={payload.get('session_id')}"
+                )
             self._ws.send(json.dumps(payload, ensure_ascii=False))
-            return json.loads(self._ws.recv())
-        except Exception:
+            raw_response = self._ws.recv(timeout=response_timeout or self.timeout)
+            response = json.loads(raw_response)
+            if self.verbose:
+                state = response.get("state", {})
+                debug = state.get("debug", {})
+                print(
+                    "[WS] recv "
+                    f"type={response.get('type')} "
+                    f"public={state.get('state')} "
+                    f"internal={debug.get('internal_state')} "
+                    f"hint={debug.get('eval_label_hint')} "
+                    f"delta={debug.get('delta_text', '')[:60]} "
+                    f"cascade={debug.get('cascade_text', '')[:60]} "
+                    f"text={state.get('text', '')[:60]} "
+                    f"elapsed={time.time() - send_start:.3f}s"
+                )
+            return response
+        except TimeoutError as exc:
+            if self.verbose:
+                print(
+                    f"[WS] recv timeout type={payload.get('type')} session_id={payload.get('session_id')} timeout={response_timeout or self.timeout}s"
+                )
+            raise TimeoutError(
+                f"Timed out waiting for WS response after {response_timeout or self.timeout}s "
+                f"for type={payload.get('type')} session_id={payload.get('session_id')}"
+            ) from exc
+        except Exception as exc:
+            if self.verbose:
+                print(
+                    f"[WS] request failed type={payload.get('type')} session_id={payload.get('session_id')} error={exc!r}; reconnecting"
+                )
             self.close()
             self.connect()
             self._ws.send(json.dumps(payload, ensure_ascii=False))
-            return json.loads(self._ws.recv())
+            raw_response = self._ws.recv(timeout=response_timeout or self.timeout)
+            response = json.loads(raw_response)
+            if self.verbose:
+                state = response.get("state", {})
+                debug = state.get("debug", {})
+                print(
+                    "[WS] recv-after-reconnect "
+                    f"type={response.get('type')} "
+                    f"public={state.get('state')} "
+                    f"internal={debug.get('internal_state')} "
+                    f"hint={debug.get('eval_label_hint')} "
+                    f"delta={debug.get('delta_text', '')[:60]} "
+                    f"cascade={debug.get('cascade_text', '')[:60]} "
+                    f"text={state.get('text', '')[:60]}"
+                )
+            return response
 
     def process(self, session_id: str, audio_chunk: np.ndarray) -> dict:
         payload = {
@@ -118,6 +175,11 @@ def parse_args():
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--post-roll-ms", type=int, default=2000)
     parser.add_argument("--ws-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce per-chunk WebSocket logs.",
+    )
     return parser.parse_args()
 
 
@@ -267,18 +329,41 @@ def evaluate_sample(
     session_id = f"{record.key}-{uuid.uuid4().hex}"
     audio = load_audio_as_float32(record.wav_path, sample_rate)
     events = []
+    total_chunks = math.ceil(len(audio) / chunk_samples) if len(audio) else 0
+    print(
+        f"[Eval] start key={record.key} subset={record.subset} label={record.label} "
+        f"samples={len(audio)} chunks={total_chunks} wav={record.wav_path}"
+    )
 
     try:
-        for chunk in iter_audio_chunks(audio, chunk_samples):
+        for chunk_index, chunk in enumerate(iter_audio_chunks(audio, chunk_samples), start=1):
+            print(
+                f"[Eval] chunk key={record.key} index={chunk_index}/{max(total_chunks, 1)} samples={len(chunk)}"
+            )
             events.append(client.process(session_id, chunk))
 
         post_roll_samples = int(sample_rate * post_roll_ms / 1000)
         if post_roll_samples > 0:
             silence = np.zeros(post_roll_samples, dtype=np.float32)
-            for chunk in iter_audio_chunks(silence, chunk_samples):
+            total_post_chunks = math.ceil(post_roll_samples / chunk_samples)
+            print(
+                f"[Eval] post-roll key={record.key} ms={post_roll_ms} samples={post_roll_samples} chunks={total_post_chunks}"
+            )
+            for chunk_index, chunk in enumerate(
+                iter_audio_chunks(silence, chunk_samples), start=1
+            ):
+                print(
+                    f"[Eval] post-roll chunk key={record.key} index={chunk_index}/{max(total_post_chunks, 1)} samples={len(chunk)}"
+                )
                 events.append(client.process(session_id, chunk))
     finally:
-        client.reset(session_id)
+        print(f"[Eval] reset session key={record.key} session_id={session_id}")
+        try:
+            client.reset(session_id)
+        except Exception as exc:
+            print(
+                f"[Eval] reset failed key={record.key} session_id={session_id} error={exc!r}"
+            )
 
     hypothesis = extract_final_hypothesis(events)
     prediction = reduce_predicted_label(events)
@@ -401,7 +486,11 @@ def main():
     records = load_dataset_records(dataset_root)
     rows = []
 
-    with TurnWSClient(args.ws_url, timeout=args.ws_timeout) as client:
+    with TurnWSClient(
+        args.ws_url,
+        timeout=args.ws_timeout,
+        verbose=not args.quiet,
+    ) as client:
         for index, record in enumerate(records, start=1):
             print(f"[{index}/{len(records)}] {record.key} -> {record.label}")
             rows.append(
