@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import numpy as np
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from ..audio import TARGET_SAMPLE_RATE, b64encode_bytes, pcm16_resample
 
@@ -20,6 +21,7 @@ class DuplugClient:
         on_user_interim: Callable[[str], Awaitable[None]],
         on_user_turn_final: Callable[[str], Awaitable[None]],
         on_turn_idle: Callable[[], Awaitable[None]],
+        on_error: Callable[[str], Awaitable[None]] | None = None,
         ws_factory: Callable[..., Awaitable[Any]] | None = None,
         url: str | None = None,
         timeout: float | None = None,
@@ -28,6 +30,7 @@ class DuplugClient:
         self._on_user_interim = on_user_interim
         self._on_user_turn_final = on_user_turn_final
         self._on_turn_idle = on_turn_idle
+        self._on_error = on_error
         self._ws_factory = ws_factory or websockets.connect
         self._url = (url or os.getenv("DUPLUG_WS_URL", "")).strip()
         self._timeout = timeout if timeout is not None else float(os.getenv("DUPLUG_WS_TIMEOUT", "10"))
@@ -44,7 +47,13 @@ class DuplugClient:
             return
         if not self._url:
             raise ValueError("Missing DUPLUG_WS_URL")
-        self._ws = await self._ws_factory(self._url, open_timeout=self._timeout)
+        self._ws = await self._ws_factory(
+            self._url,
+            open_timeout=self._timeout,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=self._timeout,
+        )
         self._running = True
         self._turn_started = False
         self._last_interim = ""
@@ -71,7 +80,7 @@ class DuplugClient:
             self._receive_task.cancel()
             try:
                 await self._receive_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, ConnectionClosed):
                 pass
             self._receive_task = None
         if self._ws:
@@ -88,6 +97,11 @@ class DuplugClient:
                 await self._handle_message(raw)
         except asyncio.CancelledError:
             raise
+        except ConnectionClosed:
+            pass
+        except Exception as exc:
+            if self._on_error:
+                await self._on_error(f"Duplug connection error: {exc}")
         finally:
             self._running = False
 

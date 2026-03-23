@@ -49,8 +49,11 @@ async def browser_ws(websocket: WebSocket) -> None:
             message_type = data.get("type")
 
             if message_type == "start":
-                await session.start()
-                started = True
+                try:
+                    await session.start()
+                    started = True
+                except Exception as exc:
+                    await transport.send_error(f"session start failed: {exc}")
                 continue
 
             if message_type == "audio":

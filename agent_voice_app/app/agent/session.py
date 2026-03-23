@@ -35,6 +35,7 @@ class AgentSession:
             on_user_interim=self._on_user_interim,
             on_user_turn_final=self._on_user_turn_final,
             on_turn_idle=self._on_turn_idle,
+            on_error=self._on_duplug_error,
         )
         self._lock = asyncio.Lock()
 
@@ -68,6 +69,9 @@ class AgentSession:
 
     async def _on_turn_idle(self) -> None:
         return None
+
+    async def _on_duplug_error(self, message: str) -> None:
+        await self.transport.send_error(message)
 
     async def _start_response(self, text: str) -> None:
         await self._cancel_active_response(send_clear=False)
