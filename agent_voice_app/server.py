@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.agent.session import AgentSession
@@ -21,6 +21,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/")
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/web", status_code=307)
 
 
 @app.get("/web")
