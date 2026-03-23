@@ -10,6 +10,12 @@
 - assistant 播报期间用户再次开口，立即打断并清空旧播放
 - 所有 assistant 下行消息带 `response_id`，旧回调自动丢弃
 
+## 交互说明
+
+- 浏览器模式默认开启 `echoCancellation / noiseSuppression / autoGainControl`，优先保证本地全双工场景下的打断能力。
+- 如果使用外放，浏览器和系统的回声消除质量会直接影响 barge-in 效果。
+- 最稳定的测试方式仍然是耳机模式；否则 assistant 播放音可能回灌进麦克风，影响 `SoulX-Duplug` 的 turn 判断。
+
 ## 目录
 
 ```text

@@ -156,9 +156,11 @@ async function ensureAudioPipeline() {
   state.mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
+      // Browser-local full duplex needs AEC, otherwise the assistant playback
+      // leaks into the mic and blocks reliable barge-in / interim ASR updates.
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
     },
   });
   state.audioContext = new AudioContext();
