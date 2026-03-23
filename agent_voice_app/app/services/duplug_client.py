@@ -78,7 +78,13 @@ class DuplugClient:
         self._send_task = asyncio.create_task(self._send_loop())
         logger.info("duplug start session_id=%s url=%s timeout=%s", self._session_id, self._url, self._timeout)
 
-    async def send_audio(self, pcm16_bytes: bytes, sample_rate: int) -> None:
+    async def send_audio(
+        self,
+        pcm16_bytes: bytes,
+        sample_rate: int,
+        captured_at_ms: float | None = None,
+        received_at_perf: float | None = None,
+    ) -> None:
         if not self._running:
             return
         resampled = pcm16_resample(pcm16_bytes, sample_rate, TARGET_SAMPLE_RATE)
@@ -92,13 +98,19 @@ class DuplugClient:
             len(resampled),
             self._send_queue.qsize(),
         )
+        packet = {
+            "pcm16": resampled,
+            "captured_at_ms": captured_at_ms,
+            "received_at_perf": received_at_perf if received_at_perf is not None else time.perf_counter(),
+        }
         while True:
             try:
-                self._send_queue.put_nowait(resampled)
+                self._send_queue.put_nowait(packet)
                 logger.info(
-                    "duplug enqueued session_id=%s queue_after=%s",
+                    "duplug enqueued session_id=%s queue_after=%s captured_at_ms=%s",
                     self._session_id,
                     self._send_queue.qsize(),
+                    captured_at_ms,
                 )
                 break
             except asyncio.QueueFull:
@@ -142,7 +154,8 @@ class DuplugClient:
     async def _send_loop(self) -> None:
         try:
             while self._running and self._ws:
-                pcm16_bytes = await self._send_queue.get()
+                packet = await self._send_queue.get()
+                pcm16_bytes = packet["pcm16"]
                 samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                 payload = {
                     "type": "audio",
@@ -151,13 +164,17 @@ class DuplugClient:
                 }
                 try:
                     self._sent_chunks += 1
+                    now = time.perf_counter()
+                    recv_gap_ms = (now - packet["received_at_perf"]) * 1000
                     logger.info(
-                        "duplug send session_id=%s chunk_idx=%s queue_after_pop=%s samples=%s elapsed_ms=%.2f",
+                        "duplug send session_id=%s chunk_idx=%s queue_after_pop=%s samples=%s elapsed_ms=%.2f browser_to_server_ms=%s server_queue_wait_ms=%.2f",
                         self._session_id,
                         self._sent_chunks,
                         self._send_queue.qsize(),
                         len(samples),
-                        (time.perf_counter() - self._started_at) * 1000,
+                        (now - self._started_at) * 1000,
+                        packet.get("captured_at_ms"),
+                        recv_gap_ms,
                     )
                     await self._ws.send(json.dumps(payload))
                 finally:

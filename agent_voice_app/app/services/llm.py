@@ -71,12 +71,19 @@ class LLMService:
         assistant_text = ""
         try:
             first_token_logged = False
+            request_started_at = time.perf_counter()
+            logger.info("llm request_start model=%s", self._model)
             stream = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "system", "content": self._system_prompt}, *self._history],
                 stream=True,
                 temperature=0.7,
                 max_tokens=400,
+            )
+            logger.info(
+                "llm request_ready model=%s elapsed_ms=%.2f",
+                self._model,
+                (time.perf_counter() - request_started_at) * 1000,
             )
             async for chunk in stream:
                 if not self._running:

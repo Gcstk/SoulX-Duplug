@@ -78,17 +78,20 @@ async def browser_ws(websocket: WebSocket) -> None:
                     await transport.send_error("audio encoding must be pcm16")
                     continue
                 sample_rate = int(data.get("sample_rate", 16000))
+                captured_at_ms = data.get("captured_at_ms")
                 pcm_bytes = b64decode_bytes(data.get("audio_b64", ""))
                 audio_message_count += 1
+                now_perf = time.perf_counter()
                 logger.info(
-                    "browser audio received stream_id=%s idx=%s sample_rate=%s bytes=%s elapsed_ms=%.2f",
+                    "browser audio received stream_id=%s idx=%s sample_rate=%s bytes=%s elapsed_ms=%.2f captured_at_ms=%s",
                     transport.stream_id,
                     audio_message_count,
                     sample_rate,
                     len(pcm_bytes),
-                    (time.perf_counter() - ws_opened_at) * 1000,
+                    (now_perf - ws_opened_at) * 1000,
+                    captured_at_ms,
                 )
-                await session.handle_audio(pcm_bytes, sample_rate)
+                await session.handle_audio(pcm_bytes, sample_rate, captured_at_ms=captured_at_ms, received_at_perf=now_perf)
                 continue
 
             if message_type == "stop":

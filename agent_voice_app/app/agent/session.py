@@ -44,6 +44,7 @@ class AgentSession:
         )
         self._lock = asyncio.Lock()
         self._started_at = time.perf_counter()
+        self._active_turn_started_at = 0.0
 
     @property
     def _stream_id(self) -> str:
@@ -64,17 +65,30 @@ class AgentSession:
         await self._cancel_active_response(send_clear=False)
         await self._duplug.stop()
 
-    async def handle_audio(self, pcm16_bytes: bytes, sample_rate: int) -> None:
+    async def handle_audio(
+        self,
+        pcm16_bytes: bytes,
+        sample_rate: int,
+        captured_at_ms: float | None = None,
+        received_at_perf: float | None = None,
+    ) -> None:
         logger.info(
-            "session handle_audio stream_id=%s bytes=%s sample_rate=%s phase=%s",
+            "session handle_audio stream_id=%s bytes=%s sample_rate=%s phase=%s captured_at_ms=%s",
             self._stream_id,
             len(pcm16_bytes),
             sample_rate,
             self.state.phase.value,
+            captured_at_ms,
         )
-        await self._duplug.send_audio(pcm16_bytes, sample_rate)
+        await self._duplug.send_audio(
+            pcm16_bytes,
+            sample_rate,
+            captured_at_ms=captured_at_ms,
+            received_at_perf=received_at_perf,
+        )
 
     async def _on_user_speech_start(self) -> None:
+        self._active_turn_started_at = time.perf_counter()
         logger.info("user speech start stream_id=%s phase=%s", self._stream_id, self.state.phase.value)
         async with self._lock:
             if self.state.phase == Phase.RESPONDING:
@@ -95,6 +109,15 @@ class AgentSession:
     async def _on_user_turn_final(self, text: str) -> None:
         async with self._lock:
             self.state.user_live_text = text
+            now = time.perf_counter()
+            asr_turn_ms = (now - self._active_turn_started_at) * 1000 if self._active_turn_started_at else 0.0
+            logger.info(
+                "asr final stream_id=%s chars=%s turn_ms=%.2f text=%r",
+                self._stream_id,
+                len(text),
+                asr_turn_ms,
+                text,
+            )
             logger.info("user final stream_id=%s chars=%s text=%r", self._stream_id, len(text), text)
             await self.transport.send_transcript("user", text, True)
             await self._start_response(text)
@@ -136,6 +159,12 @@ class AgentSession:
         )
         await self._tts.start()
         await self.transport.send_phase(self.state.phase)
+        logger.info(
+            "llm dispatch stream_id=%s response_id=%s elapsed_ms=%.2f",
+            self._stream_id,
+            response.response_id,
+            (time.perf_counter() - response.started_at) * 1000,
+        )
         await self._llm.start_turn(text)
 
     async def _cancel_active_response(self, send_clear: bool) -> None:
