@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -10,10 +11,9 @@ DEFAULT_LOG_FILE = DEFAULT_LOG_DIR / "agent_voice_app.log"
 
 
 class MillisecondFormatter(logging.Formatter):
-    default_msec_format = "%s.%03d"
-
     def formatTime(self, record, datefmt=None):  # noqa: N802
-        return super().formatTime(record, datefmt or "%Y-%m-%d %H:%M:%S")
+        timestamp = dt.datetime.fromtimestamp(record.created)
+        return timestamp.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(record.msecs):03d}"
 
 
 def setup_logging() -> Path:
