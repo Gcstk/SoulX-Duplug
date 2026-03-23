@@ -17,7 +17,7 @@ def main() -> None:
     logging.getLogger("agent_voice_app.main").info(
         "starting uvicorn host=0.0.0.0 port=%s log_file=%s", port, log_path
     )
-    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info", reload=False)
+    uvicorn.run("server:app", host="127.0.0.1", port=port, log_level="info", reload=False)
 
 
 if __name__ == "__main__":
