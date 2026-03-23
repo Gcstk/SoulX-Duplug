@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
@@ -11,9 +12,11 @@ import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from ..logging_utils import get_logger
 from ..audio import TARGET_SAMPLE_RATE, b64encode_bytes, pcm16_resample
 
 CHUNK_DURATION_MS = 160
+logger = get_logger("duplug")
 
 
 class DuplugClient:
@@ -47,6 +50,9 @@ class DuplugClient:
         self._last_interim = ""
         self._session_id = f"agent-{uuid.uuid4().hex}"
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+        self._started_at = time.perf_counter()
+        self._sent_chunks = 0
+        self._received_events = 0
 
     async def start(self) -> None:
         if self._running:
@@ -65,8 +71,12 @@ class DuplugClient:
         self._last_interim = ""
         self._session_id = f"agent-{uuid.uuid4().hex}"
         self._send_queue = asyncio.Queue(maxsize=8)
+        self._started_at = time.perf_counter()
+        self._sent_chunks = 0
+        self._received_events = 0
         self._receive_task = asyncio.create_task(self._receive_loop())
         self._send_task = asyncio.create_task(self._send_loop())
+        logger.info("duplug start session_id=%s url=%s timeout=%s", self._session_id, self._url, self._timeout)
 
     async def send_audio(self, pcm16_bytes: bytes, sample_rate: int) -> None:
         if not self._running:
@@ -74,19 +84,40 @@ class DuplugClient:
         resampled = pcm16_resample(pcm16_bytes, sample_rate, TARGET_SAMPLE_RATE)
         if not resampled:
             return
+        logger.info(
+            "duplug enqueue session_id=%s input_bytes=%s input_sample_rate=%s resampled_bytes=%s queue_before=%s",
+            self._session_id,
+            len(pcm16_bytes),
+            sample_rate,
+            len(resampled),
+            self._send_queue.qsize(),
+        )
         while True:
             try:
                 self._send_queue.put_nowait(resampled)
+                logger.info(
+                    "duplug enqueued session_id=%s queue_after=%s",
+                    self._session_id,
+                    self._send_queue.qsize(),
+                )
                 break
             except asyncio.QueueFull:
                 try:
                     _ = self._send_queue.get_nowait()
                     self._send_queue.task_done()
+                    logger.warning("duplug queue full session_id=%s dropping_oldest_chunk", self._session_id)
                 except asyncio.QueueEmpty:
                     break
 
     async def stop(self) -> None:
         self._running = False
+        logger.info(
+            "duplug stop session_id=%s elapsed_ms=%.2f sent_chunks=%s received_events=%s",
+            self._session_id,
+            (time.perf_counter() - self._started_at) * 1000,
+            self._sent_chunks,
+            self._received_events,
+        )
         if self._send_task:
             self._send_task.cancel()
             try:
@@ -119,6 +150,15 @@ class DuplugClient:
                     "audio": b64encode_bytes(samples.astype(np.float32).tobytes()),
                 }
                 try:
+                    self._sent_chunks += 1
+                    logger.info(
+                        "duplug send session_id=%s chunk_idx=%s queue_after_pop=%s samples=%s elapsed_ms=%.2f",
+                        self._session_id,
+                        self._sent_chunks,
+                        self._send_queue.qsize(),
+                        len(samples),
+                        (time.perf_counter() - self._started_at) * 1000,
+                    )
                     await self._ws.send(json.dumps(payload))
                 finally:
                     self._send_queue.task_done()
@@ -136,6 +176,14 @@ class DuplugClient:
         try:
             while self._running and self._ws:
                 raw = await self._ws.recv()
+                self._received_events += 1
+                logger.info(
+                    "duplug recv_raw session_id=%s event_idx=%s raw_chars=%s elapsed_ms=%.2f",
+                    self._session_id,
+                    self._received_events,
+                    len(raw),
+                    (time.perf_counter() - self._started_at) * 1000,
+                )
                 await self._handle_message(raw)
         except asyncio.CancelledError:
             raise
@@ -150,6 +198,7 @@ class DuplugClient:
     async def _handle_message(self, raw: str) -> None:
         data = json.loads(raw)
         if data.get("type") != "turn_state":
+            logger.info("duplug ignore session_id=%s type=%s", self._session_id, data.get("type"))
             return
         state_data = data.get("state") or {}
         if self._on_debug:
@@ -169,6 +218,14 @@ class DuplugClient:
 
     async def _process_turn_state(self, state_data: dict) -> None:
         state = (state_data.get("state") or "").strip().lower()
+        logger.info(
+            "duplug process_state session_id=%s state=%s text=%r asr_segment=%r asr_buffer=%r",
+            self._session_id,
+            state,
+            state_data.get("text", ""),
+            state_data.get("asr_segment", ""),
+            state_data.get("asr_buffer", ""),
+        )
         if state in {"", "blank"}:
             return
 

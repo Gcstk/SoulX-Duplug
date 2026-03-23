@@ -17,6 +17,9 @@ class ActiveResponse:
     llm_done: bool = False
     tts_done: bool = False
     cancelled: bool = False
+    started_at: float = 0.0
+    first_token_logged: bool = False
+    first_audio_logged: bool = False
 
 
 @dataclass

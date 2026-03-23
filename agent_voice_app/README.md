@@ -60,6 +60,14 @@ http://127.0.0.1:3040/web
 - `DUPLUG_WS_URL`: 根项目 `/turn` 地址
 - `LLM_*`: OpenAI-compatible LLM
 - `DASHSCOPE_API_KEY`: Qwen 实时 TTS key
+- `AGENT_LOG_LEVEL`: 日志级别，默认 `INFO`
+- `AGENT_LOG_FILE`: 日志文件路径，默认 `agent_voice_app/logs/agent_voice_app.log`
+
+## 日志
+
+- 控制台和文件都会输出统一日志
+- 时间精确到毫秒
+- 关键链路包含浏览器收包、Duplug 出入站、turn state、LLM 首 token、TTS 首音频、response 完成时延
 
 ## 测试
 
