@@ -76,3 +76,13 @@ class BrowserTransport:
 
     async def send_error(self, message: str) -> None:
         await self.websocket.send_text(json.dumps({"type": "error", "message": message}))
+
+    async def send_turn_debug(self, payload: dict) -> None:
+        await self.websocket.send_text(
+            json.dumps(
+                {
+                    "type": "turn_debug",
+                    "payload": payload,
+                }
+            )
+        )

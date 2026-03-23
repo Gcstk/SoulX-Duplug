@@ -8,6 +8,7 @@ const playbackState = document.getElementById("playbackState");
 const userLive = document.getElementById("userLive");
 const assistantLive = document.getElementById("assistantLive");
 const transcriptList = document.getElementById("transcriptList");
+const debugState = document.getElementById("debugState");
 
 const state = {
   ws: null,
@@ -20,6 +21,8 @@ const state = {
   playbackNodes: new Set(),
   activeResponseId: null,
   started: false,
+  pendingAudio: [],
+  chunkSamples: 2560,
 };
 
 function wsUrl() {
@@ -59,6 +62,7 @@ function clearTranscript() {
   transcriptList.innerHTML = "";
   resetLiveCard(userLive);
   resetLiveCard(assistantLive);
+  debugState.textContent = "waiting for /turn events...";
 }
 
 function float32ToBase64Pcm16(floatBuffer) {
@@ -166,18 +170,27 @@ async function ensureAudioPipeline() {
   state.audioContext = new AudioContext();
   await state.audioContext.audioWorklet.addModule("/static/pcm-capture-processor.js");
   state.browserSampleRate = state.audioContext.sampleRate;
+  state.chunkSamples = Math.max(1, Math.round(state.browserSampleRate * 0.16));
+  state.pendingAudio = [];
   state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream);
   state.workletNode = new AudioWorkletNode(state.audioContext, "pcm-capture-processor");
   state.workletNode.port.onmessage = (event) => {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN || !state.started) {
       return;
     }
-    state.ws.send(JSON.stringify({
-      type: "audio",
-      encoding: "pcm16",
-      sample_rate: state.browserSampleRate,
-      audio_b64: float32ToBase64Pcm16(event.data),
-    }));
+    const frame = event.data;
+    for (let i = 0; i < frame.length; i += 1) {
+      state.pendingAudio.push(frame[i]);
+    }
+    while (state.pendingAudio.length >= state.chunkSamples) {
+      const chunk = new Float32Array(state.pendingAudio.splice(0, state.chunkSamples));
+      state.ws.send(JSON.stringify({
+        type: "audio",
+        encoding: "pcm16",
+        sample_rate: state.browserSampleRate,
+        audio_b64: float32ToBase64Pcm16(chunk),
+      }));
+    }
   };
   const silentGain = state.audioContext.createGain();
   silentGain.gain.value = 0;
@@ -231,6 +244,10 @@ async function connect() {
       assistantLive.textContent = "...";
       return;
     }
+    if (message.type === "turn_debug") {
+      debugState.textContent = JSON.stringify(message.payload, null, 2);
+      return;
+    }
     if (message.type === "error") {
       setStatus(socketState, `error: ${message.message}`);
     }
@@ -243,6 +260,7 @@ async function connect() {
     setStatus(socketState, "closed");
     setStatus(phaseState, "offline");
     setStatus(playbackState, "idle");
+    state.pendingAudio = [];
     await shutdownAudioPipeline();
   };
 }

@@ -24,6 +24,7 @@ async def test_duplug_nonidle_and_speak_mapping():
         on_user_interim=on_interim,
         on_user_turn_final=on_final,
         on_turn_idle=on_idle,
+        on_debug=None,
         url="ws://unused",
     )
 
@@ -59,6 +60,7 @@ async def test_duplug_idle_is_forwarded():
         on_user_interim=on_interim,
         on_user_turn_final=on_final,
         on_turn_idle=on_idle,
+        on_debug=None,
         url="ws://unused",
     )
 

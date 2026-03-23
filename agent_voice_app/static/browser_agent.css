@@ -140,6 +140,32 @@ button:disabled { opacity: 0.45; cursor: default; }
   padding-right: 6px;
 }
 
+.debug-panel {
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 16px 18px;
+  background: rgba(19, 33, 41, 0.05);
+}
+
+.debug-panel h3 {
+  margin: 4px 0 0;
+  font-size: 1rem;
+  font-family: "Trebuchet MS", Helvetica, sans-serif;
+}
+
+.debug-text {
+  margin: 14px 0 0;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(19, 33, 41, 0.92);
+  color: #f4efe6;
+  font: 0.85rem/1.45 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
+
 .bubble {
   max-width: min(78%, 760px);
   border-radius: 22px;
