@@ -45,12 +45,21 @@
       </div>
 
       <div id="transcriptList" class="transcript-list"></div>
-      <section class="debug-panel">
-        <div>
-          <p class="eyebrow">Turn Debug</p>
-          <h3>Raw SoulX-Duplug state</h3>
-        </div>
-        <pre id="debugState" class="debug-text">waiting for /turn events...</pre>
+      <section class="debug-grid">
+        <section class="debug-panel">
+          <div>
+            <p class="eyebrow">Turn Debug</p>
+            <h3>Recent SoulX-Duplug state</h3>
+          </div>
+          <pre id="debugState" class="debug-text">waiting for /turn events...</pre>
+        </section>
+        <section class="debug-panel">
+          <div>
+            <p class="eyebrow">Metrics</p>
+            <h3>Latest latency summary</h3>
+          </div>
+          <pre id="metricsState" class="debug-text">waiting for response metrics...</pre>
+        </section>
       </section>
     </section>
   </main>

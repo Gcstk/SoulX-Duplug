@@ -8,12 +8,12 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
+from ..audio import TARGET_SAMPLE_RATE, b64encode_bytes, pcm16_resample
+from ..logging_utils import get_logger
+
 import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
-
-from ..logging_utils import get_logger
-from ..audio import TARGET_SAMPLE_RATE, b64encode_bytes, pcm16_resample
 
 CHUNK_DURATION_MS = 160
 logger = get_logger("duplug")
@@ -49,10 +49,11 @@ class DuplugClient:
         self._turn_started = False
         self._last_interim = ""
         self._session_id = f"agent-{uuid.uuid4().hex}"
-        self._send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+        self._send_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2)
         self._started_at = time.perf_counter()
         self._sent_chunks = 0
         self._received_events = 0
+        self._first_send_logged = False
 
     async def start(self) -> None:
         if self._running:
@@ -70,13 +71,14 @@ class DuplugClient:
         self._turn_started = False
         self._last_interim = ""
         self._session_id = f"agent-{uuid.uuid4().hex}"
-        self._send_queue = asyncio.Queue(maxsize=8)
+        self._send_queue = asyncio.Queue(maxsize=2)
         self._started_at = time.perf_counter()
         self._sent_chunks = 0
         self._received_events = 0
+        self._first_send_logged = False
         self._receive_task = asyncio.create_task(self._receive_loop())
         self._send_task = asyncio.create_task(self._send_loop())
-        logger.info("duplug start session_id=%s url=%s timeout=%s", self._session_id, self._url, self._timeout)
+        logger.info("duplug_session_started session_id=%s url=%s timeout=%s", self._session_id, self._url, self._timeout)
 
     async def send_audio(
         self,
@@ -84,13 +86,15 @@ class DuplugClient:
         sample_rate: int,
         captured_at_ms: float | None = None,
         received_at_perf: float | None = None,
+        received_at_wall_ms: float | None = None,
+        seq: int | None = None,
     ) -> None:
         if not self._running:
             return
         resampled = pcm16_resample(pcm16_bytes, sample_rate, TARGET_SAMPLE_RATE)
         if not resampled:
             return
-        logger.info(
+        logger.debug(
             "duplug enqueue session_id=%s input_bytes=%s input_sample_rate=%s resampled_bytes=%s queue_before=%s",
             self._session_id,
             len(pcm16_bytes),
@@ -102,11 +106,13 @@ class DuplugClient:
             "pcm16": resampled,
             "captured_at_ms": captured_at_ms,
             "received_at_perf": received_at_perf if received_at_perf is not None else time.perf_counter(),
+            "received_at_wall_ms": received_at_wall_ms if received_at_wall_ms is not None else time.time() * 1000,
+            "seq": seq,
         }
         while True:
             try:
                 self._send_queue.put_nowait(packet)
-                logger.info(
+                logger.debug(
                     "duplug enqueued session_id=%s queue_after=%s captured_at_ms=%s",
                     self._session_id,
                     self._send_queue.qsize(),
@@ -117,7 +123,7 @@ class DuplugClient:
                 try:
                     _ = self._send_queue.get_nowait()
                     self._send_queue.task_done()
-                    logger.warning("duplug queue full session_id=%s dropping_oldest_chunk", self._session_id)
+                    logger.debug("duplug queue full session_id=%s dropping_oldest_chunk", self._session_id)
                 except asyncio.QueueEmpty:
                     break
 
@@ -166,14 +172,28 @@ class DuplugClient:
                     self._sent_chunks += 1
                     now = time.perf_counter()
                     recv_gap_ms = (now - packet["received_at_perf"]) * 1000
-                    logger.info(
-                        "duplug send session_id=%s chunk_idx=%s queue_after_pop=%s samples=%s elapsed_ms=%.2f browser_to_server_ms=%s server_queue_wait_ms=%.2f",
+                    capture_to_server_ms = None
+                    if packet.get("captured_at_ms"):
+                        capture_to_server_ms = packet["received_at_wall_ms"] - packet["captured_at_ms"]
+                    if not self._first_send_logged:
+                        self._first_send_logged = True
+                        logger.info(
+                            "duplug_first_send session_id=%s chunk_idx=%s seq=%s capture_to_server_ms=%s server_queue_wait_ms=%.2f",
+                            self._session_id,
+                            self._sent_chunks,
+                            packet.get("seq"),
+                            f"{capture_to_server_ms:.2f}" if capture_to_server_ms is not None else None,
+                            recv_gap_ms,
+                        )
+                    logger.debug(
+                        "duplug send session_id=%s chunk_idx=%s seq=%s queue_after_pop=%s samples=%s elapsed_ms=%.2f capture_to_server_ms=%s server_queue_wait_ms=%.2f",
                         self._session_id,
                         self._sent_chunks,
+                        packet.get("seq"),
                         self._send_queue.qsize(),
                         len(samples),
                         (now - self._started_at) * 1000,
-                        packet.get("captured_at_ms"),
+                        f"{capture_to_server_ms:.2f}" if capture_to_server_ms is not None else None,
                         recv_gap_ms,
                     )
                     await self._ws.send(json.dumps(payload))
@@ -194,7 +214,7 @@ class DuplugClient:
             while self._running and self._ws:
                 raw = await self._ws.recv()
                 self._received_events += 1
-                logger.info(
+                logger.debug(
                     "duplug recv_raw session_id=%s event_idx=%s raw_chars=%s elapsed_ms=%.2f",
                     self._session_id,
                     self._received_events,
@@ -215,7 +235,7 @@ class DuplugClient:
     async def _handle_message(self, raw: str) -> None:
         data = json.loads(raw)
         if data.get("type") != "turn_state":
-            logger.info("duplug ignore session_id=%s type=%s", self._session_id, data.get("type"))
+            logger.debug("duplug ignore session_id=%s type=%s", self._session_id, data.get("type"))
             return
         state_data = data.get("state") or {}
         if self._on_debug:
@@ -229,13 +249,14 @@ class DuplugClient:
                     "debug": state_data.get("debug", {}),
                     "queue_size": self._send_queue.qsize(),
                     "chunk_ms": CHUNK_DURATION_MS,
+                    "received_event_idx": self._received_events,
                 }
             )
         await self._process_turn_state(state_data)
 
     async def _process_turn_state(self, state_data: dict) -> None:
         state = (state_data.get("state") or "").strip().lower()
-        logger.info(
+        logger.debug(
             "duplug process_state session_id=%s state=%s text=%r asr_segment=%r asr_buffer=%r",
             self._session_id,
             state,
@@ -255,6 +276,11 @@ class DuplugClient:
             if not self._turn_started:
                 self._turn_started = True
                 self._last_interim = ""
+                logger.info(
+                    "duplug_first_nonidle session_id=%s elapsed_ms=%.2f",
+                    self._session_id,
+                    (time.perf_counter() - self._started_at) * 1000,
+                )
                 await self._on_user_speech_start()
             if transcript and transcript != self._last_interim:
                 self._last_interim = transcript

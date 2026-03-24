@@ -53,12 +53,12 @@ class LLMService:
         self._history.append({"role": "user", "content": user_text})
         self._running = True
         self._started_at = time.perf_counter()
-        logger.info("llm start model=%s user_chars=%s history_len=%s", self._model, len(user_text), len(self._history))
+        logger.info("llm_dispatch model=%s user_chars=%s history_len=%s", self._model, len(user_text), len(self._history))
         self._task = asyncio.create_task(self._run())
 
     async def cancel(self) -> None:
         self._running = False
-        logger.info("llm cancel model=%s elapsed_ms=%.2f", self._model, (time.perf_counter() - self._started_at) * 1000 if self._started_at else 0.0)
+        logger.info("llm_cancel model=%s elapsed_ms=%.2f", self._model, (time.perf_counter() - self._started_at) * 1000 if self._started_at else 0.0)
         if self._task:
             self._task.cancel()
             try:
@@ -72,7 +72,7 @@ class LLMService:
         try:
             first_token_logged = False
             request_started_at = time.perf_counter()
-            logger.info("llm request_start model=%s", self._model)
+            logger.info("llm_request_start model=%s", self._model)
             stream = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "system", "content": self._system_prompt}, *self._history],
@@ -81,7 +81,7 @@ class LLMService:
                 max_tokens=400,
             )
             logger.info(
-                "llm request_ready model=%s elapsed_ms=%.2f",
+                "llm_request_ready model=%s elapsed_ms=%.2f",
                 self._model,
                 (time.perf_counter() - request_started_at) * 1000,
             )
@@ -93,18 +93,18 @@ class LLMService:
                 if token:
                     if not first_token_logged:
                         first_token_logged = True
-                        logger.info("llm first upstream token model=%s elapsed_ms=%.2f token=%r", self._model, (time.perf_counter() - self._started_at) * 1000, token)
+                        logger.info("llm_first_upstream_token model=%s elapsed_ms=%.2f token=%r", self._model, (time.perf_counter() - self._started_at) * 1000, token)
                     assistant_text += token
                     await self._on_token(token)
             if self._running and assistant_text:
                 self._history.append({"role": "assistant", "content": assistant_text})
-            logger.info("llm complete model=%s elapsed_ms=%.2f assistant_chars=%s", self._model, (time.perf_counter() - self._started_at) * 1000, len(assistant_text))
+            logger.info("llm_done model=%s elapsed_ms=%.2f assistant_chars=%s", self._model, (time.perf_counter() - self._started_at) * 1000, len(assistant_text))
             await self._on_done()
         except asyncio.CancelledError:
-            logger.info("llm task cancelled model=%s elapsed_ms=%.2f partial_chars=%s", self._model, (time.perf_counter() - self._started_at) * 1000, len(assistant_text))
+            logger.info("llm_task_cancelled model=%s elapsed_ms=%.2f partial_chars=%s", self._model, (time.perf_counter() - self._started_at) * 1000, len(assistant_text))
             raise
         except Exception:
-            logger.exception("llm error model=%s elapsed_ms=%.2f", self._model, (time.perf_counter() - self._started_at) * 1000)
+            logger.exception("llm_error model=%s elapsed_ms=%.2f", self._model, (time.perf_counter() - self._started_at) * 1000)
             await self._on_done()
         finally:
             self._running = False

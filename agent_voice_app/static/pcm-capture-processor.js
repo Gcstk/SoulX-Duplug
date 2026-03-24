@@ -1,8 +1,22 @@
 class PcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.chunkSamples = Math.max(1, Math.round(sampleRate * 0.16));
+    this.chunkSamples = Math.max(1, Math.round(sampleRate * 0.08));
     this.pending = [];
+    this.contextBaseWallMs = 0;
+    this.seq = 0;
+    this.port.onmessage = (event) => {
+      const payload = event.data || {};
+      if (payload.type !== "config") {
+        return;
+      }
+      if (payload.chunk_duration_ms) {
+        this.chunkSamples = Math.max(1, Math.round(sampleRate * (payload.chunk_duration_ms / 1000)));
+      }
+      if (payload.context_base_wall_ms) {
+        this.contextBaseWallMs = payload.context_base_wall_ms;
+      }
+    };
   }
 
   process(inputs) {
@@ -16,9 +30,13 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     }
     while (this.pending.length >= this.chunkSamples) {
       const chunk = new Float32Array(this.pending.splice(0, this.chunkSamples));
+      this.seq += 1;
       this.port.postMessage({
+        type: "chunk",
         samples: chunk,
-        captured_at_ms: currentTime * 1000,
+        seq: this.seq,
+        chunk_samples: this.chunkSamples,
+        captured_at_ms: this.contextBaseWallMs + (currentTime * 1000),
         sample_rate: sampleRate,
       });
     }

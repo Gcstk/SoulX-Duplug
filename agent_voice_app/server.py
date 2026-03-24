@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from app.agent.session import AgentSession
 from app.audio import b64decode_bytes
 from app.logging_utils import get_logger
+from app.services.tts_qwen_pool import QwenTTSPool
 from app.transport import BrowserTransport
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +21,35 @@ logger = get_logger("server")
 
 app = FastAPI(title="SoulX Agent Voice App", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class SessionRegistry:
+    def __init__(self) -> None:
+        self._sessions: dict[str, AgentSession] = {}
+
+    def add(self, session: AgentSession) -> None:
+        self._sessions[session.transport.session_id] = session
+
+    def get(self, session_id: str) -> AgentSession | None:
+        return self._sessions.get(session_id)
+
+    def pop(self, session_id: str) -> AgentSession | None:
+        return self._sessions.pop(session_id, None)
+
+
+registry = SessionRegistry()
+tts_pool = QwenTTSPool()
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    if os.getenv("TTS_POOL_PREWARM_ON_START", "true").lower() == "true":
+        await tts_pool.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    await tts_pool.stop()
 
 
 @app.get("/health")
@@ -36,26 +67,37 @@ async def web() -> FileResponse:
     return FileResponse(STATIC_DIR / "browser_agent.html")
 
 
+@app.websocket("/ws/control")
 @app.websocket("/ws/browser")
-async def browser_ws(websocket: WebSocket) -> None:
+async def control_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     transport = BrowserTransport(websocket)
-    session = AgentSession(transport)
+    await transport.start()
+    session = AgentSession(transport, tts_pool=tts_pool)
+    registry.add(session)
     await transport.send_ready()
     ws_opened_at = time.perf_counter()
-    logger.info("browser websocket accepted stream_id=%s client=%s", transport.stream_id, getattr(websocket, "client", None))
+    route = websocket.scope.get("path", "")
+    legacy_mode = route.endswith("/ws/browser")
+    logger.info(
+        "browser_session_started stream_id=%s session_id=%s client=%s legacy_mode=%s",
+        transport.stream_id,
+        transport.session_id,
+        getattr(websocket, "client", None),
+        legacy_mode,
+    )
 
     started = False
-    audio_message_count = 0
 
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             message_type = data.get("type")
-            logger.info(
-                "browser message stream_id=%s type=%s elapsed_ms=%.2f",
+            logger.debug(
+                "browser control message stream_id=%s session_id=%s type=%s elapsed_ms=%.2f",
                 transport.stream_id,
+                transport.session_id,
                 message_type,
                 (time.perf_counter() - ws_opened_at) * 1000,
             )
@@ -64,49 +106,147 @@ async def browser_ws(websocket: WebSocket) -> None:
                 try:
                     await session.start()
                     started = True
-                    logger.info("session started stream_id=%s sample_rate=%s", transport.stream_id, data.get("sample_rate"))
+                    logger.info(
+                        "browser control started stream_id=%s session_id=%s sample_rate=%s",
+                        transport.stream_id,
+                        transport.session_id,
+                        data.get("sample_rate"),
+                    )
                 except Exception as exc:
-                    logger.exception("session start failed stream_id=%s error=%s", transport.stream_id, exc)
+                    logger.exception(
+                        "session start failed stream_id=%s session_id=%s error=%s",
+                        transport.stream_id,
+                        transport.session_id,
+                        exc,
+                    )
                     await transport.send_error(f"session start failed: {exc}")
                 continue
 
             if message_type == "audio":
+                if not legacy_mode:
+                    await transport.send_error("audio must be sent to /ws/uplink")
+                    continue
                 if not started:
                     await transport.send_error("session not started")
                     continue
-                if data.get("encoding") != "pcm16":
-                    await transport.send_error("audio encoding must be pcm16")
-                    continue
-                sample_rate = int(data.get("sample_rate", 16000))
-                captured_at_ms = data.get("captured_at_ms")
-                pcm_bytes = b64decode_bytes(data.get("audio_b64", ""))
-                audio_message_count += 1
-                now_perf = time.perf_counter()
-                logger.info(
-                    "browser audio received stream_id=%s idx=%s sample_rate=%s bytes=%s elapsed_ms=%.2f captured_at_ms=%s",
-                    transport.stream_id,
-                    audio_message_count,
-                    sample_rate,
-                    len(pcm_bytes),
-                    (now_perf - ws_opened_at) * 1000,
-                    captured_at_ms,
-                )
-                await session.handle_audio(pcm_bytes, sample_rate, captured_at_ms=captured_at_ms, received_at_perf=now_perf)
+                await _handle_audio_message(session, data)
                 continue
 
             if message_type == "stop":
-                logger.info("browser requested stop stream_id=%s", transport.stream_id)
+                logger.info(
+                    "browser requested stop stream_id=%s session_id=%s",
+                    transport.stream_id,
+                    transport.session_id,
+                )
                 break
 
             await transport.send_error(f"unsupported message type: {message_type}")
 
     except WebSocketDisconnect:
-        logger.info("browser websocket disconnected stream_id=%s", transport.stream_id)
-    finally:
         logger.info(
-            "browser session stopping stream_id=%s total_elapsed_ms=%.2f audio_messages=%s",
+            "browser control disconnected stream_id=%s session_id=%s",
             transport.stream_id,
+            transport.session_id,
+        )
+    finally:
+        registry.pop(transport.session_id)
+        logger.info(
+            "browser session stopping stream_id=%s session_id=%s total_elapsed_ms=%.2f",
+            transport.stream_id,
+            transport.session_id,
             (time.perf_counter() - ws_opened_at) * 1000,
-            audio_message_count,
         )
         await session.stop()
+        await transport.stop()
+
+
+@app.websocket("/ws/uplink")
+async def uplink_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    opened_at = time.perf_counter()
+    session: AgentSession | None = None
+    stream_id = "unknown"
+    session_id = "unknown"
+    first_audio_logged = False
+    last_audio_received_at = 0.0
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            message_type = data.get("type")
+
+            if message_type == "bind":
+                session_id = str(data.get("session_id") or "")
+                session = registry.get(session_id)
+                if not session:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "unknown session_id"}))
+                    continue
+                stream_id = session.transport.stream_id
+                logger.info(
+                    "browser_uplink_connected stream_id=%s session_id=%s elapsed_ms=%.2f",
+                    stream_id,
+                    session_id,
+                    (time.perf_counter() - opened_at) * 1000,
+                )
+                continue
+
+            if message_type != "audio":
+                await websocket.send_text(json.dumps({"type": "error", "message": f"unsupported message type: {message_type}"}))
+                continue
+
+            if not session:
+                await websocket.send_text(json.dumps({"type": "error", "message": "uplink not bound"}))
+                continue
+
+            now = time.perf_counter()
+            if not first_audio_logged:
+                first_audio_logged = True
+                logger.info(
+                    "browser_audio_first_chunk stream_id=%s session_id=%s elapsed_ms=%.2f seq=%s",
+                    stream_id,
+                    session_id,
+                    (now - opened_at) * 1000,
+                    data.get("seq"),
+                )
+            if last_audio_received_at:
+                uplink_gap_ms = (now - last_audio_received_at) * 1000
+                if uplink_gap_ms > 200:
+                    logger.info(
+                        "browser_audio_gap_anomaly stream_id=%s session_id=%s gap_ms=%.2f seq=%s",
+                        stream_id,
+                        session_id,
+                        uplink_gap_ms,
+                        data.get("seq"),
+                    )
+            last_audio_received_at = now
+
+            await _handle_audio_message(session, data)
+
+    except WebSocketDisconnect:
+        logger.info(
+            "browser uplink disconnected stream_id=%s session_id=%s total_elapsed_ms=%.2f",
+            stream_id,
+            session_id,
+            (time.perf_counter() - opened_at) * 1000,
+        )
+
+
+async def _handle_audio_message(session: AgentSession, data: dict) -> None:
+    if data.get("encoding") != "pcm16":
+        await session.transport.send_error("audio encoding must be pcm16")
+        return
+    sample_rate = int(data.get("sample_rate", 16000))
+    captured_at_ms = float(data.get("captured_at_ms", 0.0) or 0.0)
+    seq = int(data.get("seq", 0) or 0)
+    pcm_bytes = b64decode_bytes(data.get("audio_b64", ""))
+    received_at_perf = time.perf_counter()
+    received_at_wall_ms = time.time() * 1000
+    await session.handle_audio(
+        pcm_bytes,
+        sample_rate,
+        captured_at_ms=captured_at_ms,
+        received_at_perf=received_at_perf,
+        received_at_wall_ms=received_at_wall_ms,
+        seq=seq,
+    )

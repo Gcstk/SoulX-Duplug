@@ -9,9 +9,13 @@ const userLive = document.getElementById("userLive");
 const assistantLive = document.getElementById("assistantLive");
 const transcriptList = document.getElementById("transcriptList");
 const debugState = document.getElementById("debugState");
+const metricsState = document.getElementById("metricsState");
 
 const state = {
-  ws: null,
+  controlWs: null,
+  uplinkWs: null,
+  streamId: null,
+  sessionId: null,
   audioContext: null,
   mediaStream: null,
   sourceNode: null,
@@ -21,11 +25,17 @@ const state = {
   playbackNodes: new Set(),
   activeResponseId: null,
   started: false,
+  uplinkBound: false,
 };
 
-function wsUrl() {
+function controlWsUrl() {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws/browser`;
+  return `${proto}//${window.location.host}/ws/control`;
+}
+
+function uplinkWsUrl() {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/ws/uplink`;
 }
 
 function setStatus(target, text) {
@@ -61,6 +71,7 @@ function clearTranscript() {
   resetLiveCard(userLive);
   resetLiveCard(assistantLive);
   debugState.textContent = "waiting for /turn events...";
+  metricsState.textContent = "waiting for response metrics...";
 }
 
 function float32ToBase64Pcm16(floatBuffer) {
@@ -158,8 +169,6 @@ async function ensureAudioPipeline() {
   state.mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
-      // Browser-local full duplex needs AEC, otherwise the assistant playback
-      // leaks into the mic and blocks reliable barge-in / interim ASR updates.
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
@@ -170,18 +179,17 @@ async function ensureAudioPipeline() {
   state.browserSampleRate = state.audioContext.sampleRate;
   state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream);
   state.workletNode = new AudioWorkletNode(state.audioContext, "pcm-capture-processor");
+  state.workletNode.port.postMessage({
+    type: "config",
+    chunk_duration_ms: 80,
+    context_base_wall_ms: Date.now() - (state.audioContext.currentTime * 1000),
+  });
   state.workletNode.port.onmessage = (event) => {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN || !state.started) {
+    const payload = event.data;
+    if (!payload || payload.type !== "chunk") {
       return;
     }
-    const payload = event.data;
-    state.ws.send(JSON.stringify({
-      type: "audio",
-      encoding: "pcm16",
-      sample_rate: payload.sample_rate || state.browserSampleRate,
-      captured_at_ms: payload.captured_at_ms,
-      audio_b64: float32ToBase64Pcm16(payload.samples),
-    }));
+    sendUplinkAudio(payload);
   };
   const silentGain = state.audioContext.createGain();
   silentGain.gain.value = 0;
@@ -190,24 +198,72 @@ async function ensureAudioPipeline() {
   setStatus(micState, "on");
 }
 
+function sendUplinkAudio(payload) {
+  if (!state.uplinkWs || state.uplinkWs.readyState !== WebSocket.OPEN || !state.started || !state.uplinkBound) {
+    return;
+  }
+  const wsSendStartedAt = performance.now();
+  state.uplinkWs.send(JSON.stringify({
+    type: "audio",
+    encoding: "pcm16",
+    seq: payload.seq,
+    chunk_samples: payload.chunk_samples,
+    sample_rate: payload.sample_rate || state.browserSampleRate,
+    captured_at_ms: payload.captured_at_ms,
+    audio_b64: float32ToBase64Pcm16(payload.samples),
+  }));
+  const captureToSendMs = performance.now() - wsSendStartedAt;
+  const bufferedAmount = state.uplinkWs.bufferedAmount;
+  if (bufferedAmount > 65536) {
+    console.debug("uplink buffered", { bufferedAmount, seq: payload.seq, captureToSendMs });
+  }
+}
+
+async function openUplinkSocket() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(uplinkWsUrl());
+    state.uplinkWs = ws;
+
+    ws.onopen = () => {
+      if (!state.sessionId) {
+        reject(new Error("missing sessionId"));
+        return;
+      }
+      ws.send(JSON.stringify({ type: "bind", session_id: state.sessionId }));
+      state.uplinkBound = true;
+      resolve();
+    };
+
+    ws.onerror = () => reject(new Error("uplink websocket failed"));
+    ws.onclose = () => {
+      state.uplinkBound = false;
+      state.uplinkWs = null;
+    };
+  });
+}
+
 async function connect() {
   connectBtn.disabled = true;
   setStatus(socketState, "connecting");
-  const ws = new WebSocket(wsUrl());
-  state.ws = ws;
+  const ws = new WebSocket(controlWsUrl());
+  state.controlWs = ws;
 
   ws.onopen = () => {
     disconnectBtn.disabled = false;
-    setStatus(socketState, "open");
+    setStatus(socketState, "control-open");
   };
 
   ws.onmessage = async (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "ready") {
+      state.streamId = message.stream_id;
+      state.sessionId = message.session_id;
       await ensureAudioPipeline();
       await state.audioContext.resume();
+      await openUplinkSocket();
       state.started = true;
       state.playbackClock = state.audioContext.currentTime;
+      setStatus(socketState, "control+uplink");
       ws.send(JSON.stringify({ type: "start", sample_rate: state.browserSampleRate }));
       return;
     }
@@ -239,6 +295,10 @@ async function connect() {
       debugState.textContent = JSON.stringify(message.payload, null, 2);
       return;
     }
+    if (message.type === "metrics") {
+      metricsState.textContent = JSON.stringify(message.payload, null, 2);
+      return;
+    }
     if (message.type === "error") {
       setStatus(socketState, `error: ${message.message}`);
     }
@@ -248,17 +308,25 @@ async function connect() {
     disconnectBtn.disabled = true;
     connectBtn.disabled = false;
     state.started = false;
+    state.sessionId = null;
+    state.streamId = null;
     setStatus(socketState, "closed");
     setStatus(phaseState, "offline");
     setStatus(playbackState, "idle");
+    if (state.uplinkWs && state.uplinkWs.readyState === WebSocket.OPEN) {
+      state.uplinkWs.close();
+    }
     await shutdownAudioPipeline();
   };
 }
 
 async function disconnect() {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({ type: "stop" }));
-    state.ws.close();
+  if (state.controlWs && state.controlWs.readyState === WebSocket.OPEN) {
+    state.controlWs.send(JSON.stringify({ type: "stop" }));
+    state.controlWs.close();
+  }
+  if (state.uplinkWs && state.uplinkWs.readyState === WebSocket.OPEN) {
+    state.uplinkWs.close();
   }
 }
 

@@ -66,3 +66,26 @@ async def test_duplug_idle_is_forwarded():
 
     await client._process_turn_state({"state": "idle"})
     assert events == ["idle"]
+
+
+@pytest.mark.asyncio
+async def test_duplug_queue_keeps_latest_chunks():
+    async def noop(*_args, **_kwargs):
+        return None
+
+    client = DuplugClient(
+        on_user_speech_start=noop,
+        on_user_interim=noop,
+        on_user_turn_final=noop,
+        on_turn_idle=noop,
+        on_debug=None,
+        url="ws://unused",
+    )
+    client._running = True
+
+    for idx in range(4):
+        await client.send_audio(b"\x00\x00" * 1280, 16000, seq=idx + 1)
+
+    assert client._send_queue.qsize() == 2
+    queued = list(client._send_queue._queue)
+    assert [packet["seq"] for packet in queued] == [3, 4]
