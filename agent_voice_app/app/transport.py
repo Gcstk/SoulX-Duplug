@@ -198,7 +198,7 @@ class BrowserTransport:
             payload.get("asr_segment", ""),
             payload.get("asr_buffer", ""),
         )
-        if self._last_debug_signature == signature and (now - self._debug_sent_at) < 0.25:
+        if self._last_debug_signature == signature and (now - self._debug_sent_at) < 0.75:
             return
         self._last_debug_signature = signature
         self._debug_sent_at = now
@@ -217,7 +217,7 @@ class BrowserTransport:
                     "server_elapsed_ms": round((time.perf_counter() - self._started_at) * 1000, 2),
                 },
             },
-            P0_CONTROL,
+            P1_TEXT,
         )
 
     async def invalidate_response(self, response_id: str | None) -> None:
