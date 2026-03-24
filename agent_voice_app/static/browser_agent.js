@@ -12,6 +12,7 @@ const debugState = document.getElementById("debugState");
 const metricsState = document.getElementById("metricsState");
 
 const state = {
+  assetVersion: "20260324b",
   controlWs: null,
   uplinkWs: null,
   streamId: null,
@@ -175,7 +176,7 @@ async function ensureAudioPipeline() {
     },
   });
   state.audioContext = new AudioContext();
-  await state.audioContext.audioWorklet.addModule("/static/pcm-capture-processor.js");
+  await state.audioContext.audioWorklet.addModule(`/static/pcm-capture-processor.js?v=${state.assetVersion}`);
   state.browserSampleRate = state.audioContext.sampleRate;
   state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream);
   state.workletNode = new AudioWorkletNode(state.audioContext, "pcm-capture-processor");
@@ -256,6 +257,7 @@ async function connect() {
   ws.onmessage = async (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "ready") {
+      console.info("agent_voice_app frontend version", state.assetVersion);
       state.streamId = message.stream_id;
       state.sessionId = message.session_id;
       await ensureAudioPipeline();
