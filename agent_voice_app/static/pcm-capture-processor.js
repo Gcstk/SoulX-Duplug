@@ -43,16 +43,21 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       this.pending.push(channel[i]);
     }
     while (this.pending.length >= this.chunkSamples) {
-      const chunk = new Float32Array(this.pending.splice(0, this.chunkSamples));
+      const floatChunk = this.pending.splice(0, this.chunkSamples);
+      const pcm16 = new Int16Array(floatChunk.length);
+      for (let i = 0; i < floatChunk.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, floatChunk[i]));
+        pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      }
       this.seq += 1;
       this.port.postMessage({
         type: "chunk",
-        samples: chunk,
+        pcm_buffer: pcm16.buffer,
         seq: this.seq,
         chunk_samples: this.chunkSamples,
         captured_at_ms: this.contextBaseWallMs + (currentTime * 1000),
         sample_rate: sampleRate,
-      });
+      }, [pcm16.buffer]);
     }
     return true;
   }

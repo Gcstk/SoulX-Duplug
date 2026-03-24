@@ -12,9 +12,10 @@ const debugState = document.getElementById("debugState");
 const metricsState = document.getElementById("metricsState");
 
 const state = {
-  assetVersion: "20260324c",
+  assetVersion: "20260324d",
   controlWs: null,
   uplinkWs: null,
+  audioWs: null,
   streamId: null,
   sessionId: null,
   audioContext: null,
@@ -27,23 +28,22 @@ const state = {
   activeResponseId: null,
   started: false,
   uplinkBound: false,
+  audioBound: false,
   renderTimer: null,
   pendingDebugPayload: null,
   pendingMetricsPayload: null,
-  liveText: {
-    user: "...",
-    assistant: "...",
-  },
+  liveText: { user: "...", assistant: "..." },
+  llmFinalText: "",
+  playbackAckStartedAt: 0,
 };
 
-function controlWsUrl() {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws/control`;
-}
+const UPLINK_FRAME_MS = 40;
+const MAX_UPLINK_BUFFER = 65536;
+const MAX_PLAYBACK_BUFFER_MS = 200;
 
-function uplinkWsUrl() {
+function wsUrl(path) {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws/uplink`;
+  return `${proto}//${window.location.host}${path}`;
 }
 
 function setStatus(target, text) {
@@ -57,10 +57,6 @@ function escapeHtml(text) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function resetLiveCard(target) {
-  target.textContent = "...";
 }
 
 function scheduleRender() {
@@ -79,7 +75,7 @@ function scheduleRender() {
       metricsState.textContent = JSON.stringify(state.pendingMetricsPayload, null, 2);
       state.pendingMetricsPayload = null;
     }
-  }, 120);
+  }, 80);
 }
 
 function appendBubble(speaker, text) {
@@ -95,29 +91,34 @@ function appendBubble(speaker, text) {
 
 function clearTranscript() {
   transcriptList.innerHTML = "";
-  resetLiveCard(userLive);
-  resetLiveCard(assistantLive);
   debugState.textContent = "waiting for /turn events...";
   metricsState.textContent = "waiting for response metrics...";
-  state.liveText.user = "...";
-  state.liveText.assistant = "...";
+  state.liveText = { user: "...", assistant: "..." };
+  state.llmFinalText = "";
   state.pendingDebugPayload = null;
   state.pendingMetricsPayload = null;
+  scheduleRender();
 }
 
-function float32ToBase64Pcm16(floatBuffer) {
-  const pcm = new Int16Array(floatBuffer.length);
-  for (let i = 0; i < floatBuffer.length; i += 1) {
-    const sample = Math.max(-1, Math.min(1, floatBuffer[i]));
-    pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-  }
-  const bytes = new Uint8Array(pcm.buffer);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
+function packAudioFrame(header, pcmBuffer) {
+  // Keep audio frames binary on the wire: a tiny JSON header plus raw PCM16.
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const packed = new Uint8Array(4 + headerBytes.length + pcmBuffer.byteLength);
+  const view = new DataView(packed.buffer);
+  view.setUint32(0, headerBytes.length, false);
+  packed.set(headerBytes, 4);
+  packed.set(new Uint8Array(pcmBuffer), 4 + headerBytes.length);
+  return packed.buffer;
+}
+
+function unpackAudioFrame(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  const headerLen = view.getUint32(0, false);
+  const headerBytes = bytes.slice(4, 4 + headerLen);
+  const payload = bytes.slice(4 + headerLen).buffer;
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  return { header, payload };
 }
 
 function base64ToInt16(base64) {
@@ -129,17 +130,15 @@ function base64ToInt16(base64) {
   return new Int16Array(bytes.buffer);
 }
 
-function playPcmChunk(base64, sampleRate, responseId) {
+function playPcmChunk(pcmBuffer, sampleRate, responseId, generatedAtMs) {
   if (!state.audioContext) {
     return;
   }
   if (state.activeResponseId && responseId && responseId !== state.activeResponseId) {
     return;
   }
-  if (responseId) {
-    state.activeResponseId = responseId;
-  }
-  const samples = base64ToInt16(base64);
+  state.activeResponseId = responseId;
+  const samples = new Int16Array(pcmBuffer);
   const buffer = state.audioContext.createBuffer(1, samples.length, sampleRate);
   const channel = buffer.getChannelData(0);
   for (let i = 0; i < samples.length; i += 1) {
@@ -149,15 +148,32 @@ function playPcmChunk(base64, sampleRate, responseId) {
   source.buffer = buffer;
   source.connect(state.audioContext.destination);
   const now = state.audioContext.currentTime;
+  const queuedMs = Math.max(0, (state.playbackClock - now) * 1000);
+  if (queuedMs > MAX_PLAYBACK_BUFFER_MS) {
+    // Prefer dropping stale media over deepening the playback tail, because
+    // barge-in correctness matters more than perfect continuity in this app.
+    console.debug("drop tts chunk due to deep buffer", { queuedMs, responseId });
+    return;
+  }
   state.playbackClock = Math.max(state.playbackClock, now);
   source.start(state.playbackClock);
   state.playbackClock += buffer.duration;
   source.onended = () => state.playbackNodes.delete(source);
   state.playbackNodes.add(source);
   setStatus(playbackState, "streaming");
+  if (generatedAtMs) {
+    state.pendingMetricsPayload = {
+      ...(state.pendingMetricsPayload || {}),
+      downlink_audio_buffer_ms: Math.round(queuedMs),
+      audio_chunk_age_ms: Math.round(Date.now() - generatedAtMs),
+      queued_audio_chunks: state.playbackNodes.size,
+    };
+    scheduleRender();
+  }
 }
 
 function clearPlayback() {
+  state.playbackAckStartedAt = performance.now();
   state.playbackClock = state.audioContext ? state.audioContext.currentTime : 0;
   for (const node of state.playbackNodes) {
     try {
@@ -165,8 +181,16 @@ function clearPlayback() {
     } catch (_err) {}
   }
   state.playbackNodes.clear();
+  const responseId = state.activeResponseId;
   state.activeResponseId = null;
   setStatus(playbackState, "cleared");
+  if (state.audioWs && state.audioWs.readyState === WebSocket.OPEN) {
+    state.audioWs.send(JSON.stringify({
+      type: "playback_stop_ack",
+      response_id: responseId,
+      elapsed_ms: Math.round(performance.now() - state.playbackAckStartedAt),
+    }));
+  }
 }
 
 async function shutdownAudioPipeline() {
@@ -213,7 +237,7 @@ async function ensureAudioPipeline() {
   state.workletNode = new AudioWorkletNode(state.audioContext, "pcm-capture-processor");
   state.workletNode.port.postMessage({
     type: "config",
-    chunk_duration_ms: 80,
+    chunk_duration_ms: UPLINK_FRAME_MS,
     context_base_wall_ms: Date.now() - (state.audioContext.currentTime * 1000),
   });
   state.workletNode.port.onmessage = (event) => {
@@ -234,26 +258,31 @@ function sendUplinkAudio(payload) {
   if (!state.uplinkWs || state.uplinkWs.readyState !== WebSocket.OPEN || !state.started || !state.uplinkBound) {
     return;
   }
-  state.uplinkWs.send(JSON.stringify({
-    type: "audio",
-    encoding: "pcm16",
-    seq: payload.seq,
-    chunk_samples: payload.chunk_samples,
-    sample_rate: payload.sample_rate || state.browserSampleRate,
-    captured_at_ms: payload.captured_at_ms,
-    audio_b64: float32ToBase64Pcm16(payload.samples),
-  }));
   const bufferedAmount = state.uplinkWs.bufferedAmount;
-  if (bufferedAmount > 65536) {
+  if (bufferedAmount > MAX_UPLINK_BUFFER) {
     console.debug("uplink buffered", { bufferedAmount, seq: payload.seq });
+    return;
   }
+  const frame = packAudioFrame(
+    {
+      type: "audio_in",
+      session_id: state.sessionId,
+      seq: payload.seq,
+      captured_at_ms: payload.captured_at_ms,
+      sample_rate: payload.sample_rate || state.browserSampleRate,
+      frame_ms: UPLINK_FRAME_MS,
+      uplink_buffered_bytes: bufferedAmount,
+    },
+    payload.pcm_buffer,
+  );
+  state.uplinkWs.send(frame);
 }
 
 async function openUplinkSocket() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(uplinkWsUrl());
+    const ws = new WebSocket(wsUrl("/ws/uplink"));
+    ws.binaryType = "arraybuffer";
     state.uplinkWs = ws;
-
     ws.onopen = () => {
       if (!state.sessionId) {
         reject(new Error("missing sessionId"));
@@ -263,7 +292,6 @@ async function openUplinkSocket() {
       state.uplinkBound = true;
       resolve();
     };
-
     ws.onerror = () => reject(new Error("uplink websocket failed"));
     ws.onclose = () => {
       state.uplinkBound = false;
@@ -272,10 +300,41 @@ async function openUplinkSocket() {
   });
 }
 
+async function openAudioSocket() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl("/ws/downlink-audio"));
+    ws.binaryType = "arraybuffer";
+    state.audioWs = ws;
+    ws.onopen = () => {
+      if (!state.sessionId) {
+        reject(new Error("missing sessionId"));
+        return;
+      }
+      ws.send(JSON.stringify({ type: "bind", session_id: state.sessionId }));
+      state.audioBound = true;
+      resolve();
+    };
+    ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        return;
+      }
+      const { header, payload } = unpackAudioFrame(event.data);
+      if (header.type === "tts_chunk") {
+        playPcmChunk(payload, header.sample_rate, header.response_id, header.generated_at_ms);
+      }
+    };
+    ws.onerror = () => reject(new Error("downlink audio websocket failed"));
+    ws.onclose = () => {
+      state.audioBound = false;
+      state.audioWs = null;
+    };
+  });
+}
+
 async function connect() {
   connectBtn.disabled = true;
   setStatus(socketState, "connecting");
-  const ws = new WebSocket(controlWsUrl());
+  const ws = new WebSocket(wsUrl("/ws/control"));
   state.controlWs = ws;
 
   ws.onopen = () => {
@@ -292,50 +351,67 @@ async function connect() {
       await ensureAudioPipeline();
       await state.audioContext.resume();
       await openUplinkSocket();
+      await openAudioSocket();
       state.started = true;
       state.playbackClock = state.audioContext.currentTime;
-      setStatus(socketState, "control+uplink");
+      setStatus(socketState, "ready");
       ws.send(JSON.stringify({ type: "start", sample_rate: state.browserSampleRate }));
       state.workletNode.port.postMessage({ type: "start" });
       return;
     }
-    if (message.type === "phase") {
-      setStatus(phaseState, message.phase.toLowerCase());
+    if (message.type === "session_control") {
+      if (message.event === "phase") {
+        setStatus(phaseState, message.phase.toLowerCase());
+      } else if (message.event === "turn_debug") {
+        state.pendingDebugPayload = message.payload;
+        scheduleRender();
+      } else if (message.event === "metrics") {
+        state.pendingMetricsPayload = message.payload;
+        scheduleRender();
+      } else if (message.event === "error") {
+        setStatus(socketState, `error: ${message.message}`);
+      }
       return;
     }
-    if (message.type === "transcript") {
-      state.liveText[message.speaker] = message.text || "...";
-      scheduleRender();
-      if (message.final) {
-        appendBubble(message.speaker, message.text);
+    if (message.type === "turn_event") {
+      if (message.kind === "speech_start") {
+        state.liveText.user = state.liveText.user || "...";
+        scheduleRender();
       }
-      if (message.speaker === "assistant" && message.response_id) {
+      return;
+    }
+    if (message.type === "interrupt") {
+      if (message.kind === "clear_audio") {
+        clearPlayback();
+        state.liveText.assistant = "...";
+        scheduleRender();
+      }
+      return;
+    }
+    if (message.type === "asr_partial") {
+      state.liveText.user = message.text || "...";
+      scheduleRender();
+      return;
+    }
+    if (message.type === "asr_final") {
+      state.liveText.user = message.text || "...";
+      appendBubble("user", message.text || "");
+      scheduleRender();
+      return;
+    }
+    if (message.type === "llm_token") {
+      state.liveText.assistant = `${state.liveText.assistant === "..." ? "" : state.liveText.assistant}${message.text || ""}` || "...";
+      if (message.response_id) {
         state.activeResponseId = message.response_id;
       }
-      return;
-    }
-    if (message.type === "audio") {
-      playPcmChunk(message.audio_b64, message.sample_rate, message.response_id);
-      return;
-    }
-    if (message.type === "clear_audio") {
-      clearPlayback();
-      state.liveText.assistant = "...";
       scheduleRender();
       return;
     }
-    if (message.type === "turn_debug") {
-      state.pendingDebugPayload = message.payload;
+    if (message.type === "llm_final") {
+      state.llmFinalText = message.text || "";
+      state.liveText.assistant = state.llmFinalText || "...";
+      appendBubble("assistant", state.llmFinalText);
       scheduleRender();
-      return;
-    }
-    if (message.type === "metrics") {
-      state.pendingMetricsPayload = message.payload;
-      scheduleRender();
-      return;
-    }
-    if (message.type === "error") {
-      setStatus(socketState, `error: ${message.message}`);
     }
   };
 
@@ -351,6 +427,9 @@ async function connect() {
     if (state.uplinkWs && state.uplinkWs.readyState === WebSocket.OPEN) {
       state.uplinkWs.close();
     }
+    if (state.audioWs && state.audioWs.readyState === WebSocket.OPEN) {
+      state.audioWs.close();
+    }
     await shutdownAudioPipeline();
   };
 }
@@ -362,6 +441,9 @@ async function disconnect() {
   }
   if (state.uplinkWs && state.uplinkWs.readyState === WebSocket.OPEN) {
     state.uplinkWs.close();
+  }
+  if (state.audioWs && state.audioWs.readyState === WebSocket.OPEN) {
+    state.audioWs.close();
   }
 }
 

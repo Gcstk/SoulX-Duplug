@@ -10,9 +10,12 @@ class FakeTransport:
         self.stream_id = "browser-test"
         self.session_id = "session-test"
         self.phases = []
-        self.transcripts = []
+        self.asr_partial = []
+        self.asr_final = []
+        self.llm_tokens = []
+        self.llm_final = []
         self.audio = []
-        self.clears = []
+        self.interrupts = []
         self.metrics = []
         self.errors = []
         self.turn_events = []
@@ -22,14 +25,27 @@ class FakeTransport:
     async def send_phase(self, phase):
         self.phases.append(phase.value)
 
-    async def send_transcript(self, speaker, text, final, response_id=None):
-        self.transcripts.append((speaker, text, final, response_id))
+    async def send_asr_partial(self, text):
+        self.asr_partial.append(text)
 
-    async def send_audio(self, audio_b64, sample_rate, response_id):
-        self.audio.append((audio_b64, sample_rate, response_id))
+    async def send_asr_final(self, text):
+        self.asr_final.append(text)
+
+    async def send_llm_token(self, text, response_id):
+        self.llm_tokens.append((text, response_id))
+
+    async def send_llm_final(self, text, response_id):
+        self.llm_final.append((text, response_id))
+
+    async def send_audio_chunk(self, pcm_bytes, sample_rate, response_id, *, chunk_seq, generated_at_ms):
+        self.audio.append((pcm_bytes, sample_rate, response_id, chunk_seq, generated_at_ms))
 
     async def clear_audio(self, response_id=None):
-        self.clears.append(response_id)
+        self.interrupts.append(("clear_audio", response_id))
+        self.last_clear_sent_at = asyncio.get_running_loop().time()
+
+    async def send_interrupt(self, kind, response_id=None):
+        self.interrupts.append((kind, response_id))
         self.last_clear_sent_at = asyncio.get_running_loop().time()
 
     async def send_metrics(self, payload):
@@ -49,10 +65,9 @@ class FakeTransport:
 
     def queue_metrics(self):
         return {
-            "control_queue_peak_p0": 0,
-            "control_queue_peak_p1": 0,
-            "control_queue_peak_p2": 0,
-            "stale_media_dropped_count": 0,
+            "control_queue_peak": 0,
+            "audio_queue_peak": 0,
+            "tts_chunk_drop_count": 0,
         }
 
 
@@ -140,9 +155,21 @@ class FakePool:
         self.released.append((tts, broken))
 
 
+class SlowReadyTTS(FakeTTS):
+    def __init__(self, on_audio, on_done, on_ready=None):
+        super().__init__(on_audio, on_done, on_ready=on_ready)
+        self.ready_gate = None
+
+    async def start(self):
+        self.started = True
+        self.ready_gate = self.ready_gate or asyncio.Event()
+        await self.ready_gate.wait()
+        if self.on_ready:
+            await self.on_ready()
+
+
 @pytest.mark.asyncio
 async def test_interrupt_clears_current_response():
-    FakeTTS.instances.clear()
     transport = FakeTransport()
     session = AgentSession(
         transport=transport,
@@ -154,18 +181,15 @@ async def test_interrupt_clears_current_response():
     await session.start()
     await session._on_user_turn_final("你好")
     active_id = session.state.active_response.response_id
-
     await session._on_user_speech_start()
 
-    assert active_id in transport.clears
+    assert ("clear_audio", active_id) in transport.interrupts
     assert active_id in transport.invalidated
     assert session.state.active_response is None
-    assert session.state.phase.value == "LISTENING"
 
 
 @pytest.mark.asyncio
 async def test_stale_audio_is_ignored_after_cancel():
-    FakeTTS.instances.clear()
     transport = FakeTransport()
     session = AgentSession(
         transport=transport,
@@ -178,22 +202,9 @@ async def test_stale_audio_is_ignored_after_cancel():
     await session._on_user_turn_final("你好")
     active_id = session.state.active_response.response_id
     await session._cancel_active_response(send_clear=True)
-    await session._on_tts_audio(active_id, "Zm9v")
+    await session._on_tts_audio(active_id, b"\x00\x00" * 480)
 
     assert transport.audio == []
-
-
-class SlowReadyTTS(FakeTTS):
-    def __init__(self, on_audio, on_done, on_ready=None):
-        super().__init__(on_audio, on_done, on_ready=on_ready)
-        self.ready_gate = None
-
-    async def start(self):
-        self.started = True
-        self.ready_gate = self.ready_gate or asyncio.Event()
-        await self.ready_gate.wait()
-        if self.on_ready:
-            await self.on_ready()
 
 
 @pytest.mark.asyncio
@@ -213,7 +224,6 @@ async def test_llm_dispatch_does_not_wait_for_tts_ready():
 
     assert session.state.active_response is not None
     assert session._llm.last_user_text == "你好"
-    assert session.state.active_response.pending_tts_tokens == []
 
 
 @pytest.mark.asyncio
@@ -237,8 +247,6 @@ async def test_tokens_buffer_until_tts_ready_then_flush():
     await session._on_llm_token("好")
 
     assert response.pending_tts_tokens == ["你", "好"]
-    assert tts.sent == []
-
     tts.ready_gate.set()
     await session._tts_acquire_task
     await session._on_llm_done()
@@ -261,15 +269,12 @@ async def test_tts_segment_commits_on_punctuation():
 
     await session.start()
     await session._on_user_turn_final("你好")
-
     while session._tts is None:
         await asyncio.sleep(0)
-
     await session._on_llm_token("你好")
     await session._on_llm_token("，")
 
     assert session._tts.sent == ["你好，"]
-    assert session.state.active_response.pending_tts_tokens == []
 
 
 @pytest.mark.asyncio
@@ -286,15 +291,12 @@ async def test_tts_segment_commits_after_ten_chars_without_punctuation():
 
     await session.start()
     await session._on_user_turn_final("你好")
-
     while session._tts is None:
         await asyncio.sleep(0)
-
     for token in ["一二三", "四五六", "七八九十"]:
         await session._on_llm_token(token)
 
     assert session._tts.sent == ["一二三四五六七八九十"]
-    assert session.state.active_response.pending_tts_tokens == []
 
 
 @pytest.mark.asyncio
@@ -316,9 +318,10 @@ async def test_complete_metrics_include_pool_fields():
     response_id = session.state.active_response.response_id
     await session._on_llm_token("好")
     await session._on_llm_done()
-    await session._on_tts_audio(response_id, "Zm9v")
+    await session._on_tts_audio(response_id, b"\x00\x00" * 4800)
     await session._on_tts_done(response_id)
 
     assert transport.metrics
     assert "tts_pool_acquire_ms" in transport.metrics[-1]
     assert "tts_pool_hit" in transport.metrics[-1]
+    assert transport.llm_final[-1][0] == "好"

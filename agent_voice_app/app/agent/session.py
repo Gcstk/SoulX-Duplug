@@ -5,6 +5,7 @@ import time
 import uuid
 from collections.abc import Callable
 
+from ..audio import chunk_pcm16
 from ..logging_utils import get_logger
 from ..services.duplug_client import DuplugClient
 from ..services.llm import LLMService
@@ -16,6 +17,7 @@ from ..types import ActiveResponse, Phase, SessionState
 logger = get_logger("session")
 TTS_SEGMENT_MIN_CHARS = 10
 TTS_SEGMENT_PUNCTUATION = "。！？!?；;，,\n"
+TTS_AUDIO_MAX_CHUNK_MS = 120
 
 
 class AgentSession:
@@ -54,6 +56,7 @@ class AgentSession:
         self._turn_last_captured_at_ms = 0.0
         self._turn_last_audio_seq = 0
         self._last_ingress_perf = 0.0
+        self._tts_chunk_seq = 0
 
     @property
     def _stream_id(self) -> str:
@@ -123,8 +126,6 @@ class AgentSession:
 
     async def _on_user_speech_start(self) -> None:
         self._active_turn_started_at = time.perf_counter()
-        logger.info("turn_nonidle stream_id=%s session_id=%s phase=%s", self._stream_id, self.transport.session_id, self.state.phase.value)
-        await self.transport.send_turn_event("nonidle")
         async with self._lock:
             if self.state.phase == Phase.RESPONDING:
                 response = self.state.active_response
@@ -140,11 +141,13 @@ class AgentSession:
                 await self._cancel_active_response(send_clear=True)
                 self.state.phase = Phase.LISTENING
                 await self.transport.send_phase(self.state.phase)
+        logger.info("turn_nonidle stream_id=%s session_id=%s phase=%s", self._stream_id, self.transport.session_id, self.state.phase.value)
+        await self.transport.send_turn_event("speech_start")
 
     async def _on_user_interim(self, text: str) -> None:
         self.state.user_live_text = text
         logger.debug("user interim stream_id=%s chars=%s text=%r", self._stream_id, len(text), text)
-        await self.transport.send_transcript("user", text, False)
+        await self.transport.send_asr_partial(text)
 
     async def _on_user_turn_final(self, text: str) -> None:
         async with self._lock:
@@ -161,7 +164,7 @@ class AgentSession:
                 self.transport.session_id,
                 self._turn_last_audio_seq,
             )
-            await self.transport.send_turn_event("complete", text)
+            await self.transport.send_turn_event("turn_end", text)
             logger.info(
                 "asr_final stream_id=%s session_id=%s seq=%s chars=%s asr_turn_ms=%.2f capture_to_asr_final_ms=%s text=%r",
                 self._stream_id,
@@ -172,7 +175,7 @@ class AgentSession:
                 f"{capture_to_asr_final_ms:.2f}" if capture_to_asr_final_ms is not None else None,
                 text,
             )
-            await self.transport.send_transcript("user", text, True)
+            await self.transport.send_asr_final(text)
             await self._start_response(
                 text,
                 asr_final_at=now,
@@ -368,7 +371,7 @@ class AgentSession:
             len(token),
             len(response.assistant_text),
         )
-        await self.transport.send_transcript("assistant", response.assistant_text, False, response.response_id)
+        await self.transport.send_llm_token(token, response.response_id)
         response.pending_tts_tokens.append(token)
         if response.tts_ready and self._tts:
             await self._maybe_send_tts_segment(response, force=False)
@@ -391,7 +394,7 @@ class AgentSession:
         elif response.tts_failed:
             await self._finish_response_if_ready(response.response_id)
 
-    async def _on_tts_audio(self, response_id: str, audio_b64: str) -> None:
+    async def _on_tts_audio(self, response_id: str, pcm_bytes: bytes) -> None:
         response = self.state.active_response
         if not response or response.cancelled or response.response_id != response_id or not self._tts:
             return
@@ -404,16 +407,20 @@ class AgentSession:
                 self.transport.session_id,
                 response_id,
                 (response.tts_first_audio_at - response.response_started_at) * 1000,
-                len(audio_b64),
+                len(pcm_bytes),
             )
-        logger.debug(
-            "tts audio stream_id=%s session_id=%s response_id=%s bytes_b64=%s",
-            self._stream_id,
-            self.transport.session_id,
-            response_id,
-            len(audio_b64),
-        )
-        await self.transport.send_audio(audio_b64, self._tts.sample_rate, response_id)
+        chunks = chunk_pcm16(pcm_bytes, self._tts.sample_rate, TTS_AUDIO_MAX_CHUNK_MS)
+        generated_at_ms = time.time() * 1000
+        for chunk in chunks:
+            self._tts_chunk_seq += 1
+            response.metadata["tts_chunks_emitted"] = response.metadata.get("tts_chunks_emitted", 0) + 1
+            await self.transport.send_audio_chunk(
+                chunk,
+                self._tts.sample_rate,
+                response_id,
+                chunk_seq=self._tts_chunk_seq,
+                generated_at_ms=generated_at_ms,
+            )
 
     async def _on_tts_done(self, response_id: str) -> None:
         response = self.state.active_response
@@ -452,7 +459,7 @@ class AgentSession:
             if response.tts_segment_in_flight:
                 return
 
-        await self.transport.send_transcript("assistant", response.assistant_text, True, response_id)
+        await self.transport.send_llm_final(response.assistant_text, response_id)
 
         metrics = {
             "response_id": response.response_id,
@@ -476,6 +483,8 @@ class AgentSession:
             ),
             "interrupt_detect_to_clear_sent_ms": self._round_ms(response.metadata.get("interrupt_detect_to_clear_sent_ms")),
             "response_total_ms": self._round_ms((time.perf_counter() - response.response_started_at) * 1000),
+            "tts_segments_committed": response.tts_segments_sent,
+            "tts_chunks_emitted": response.metadata.get("tts_chunks_emitted", 0),
         }
         metrics.update(self.transport.queue_metrics())
         logger.info(
@@ -506,6 +515,8 @@ class AgentSession:
     async def _maybe_send_tts_segment(self, response: ActiveResponse, *, force: bool) -> None:
         if not response.tts_ready or not self._tts or response.cancelled or response.tts_segment_in_flight:
             return
+        # Only allow one committed TTS segment in flight. This keeps barge-in
+        # predictable and avoids building an unbounded synth backlog upstream.
         segment = self._drain_tts_segment(response.pending_tts_tokens, force=force)
         if not segment:
             return
@@ -513,12 +524,13 @@ class AgentSession:
         response.tts_done = False
         response.tts_segments_sent += 1
         logger.info(
-            "tts_segment_commit stream_id=%s session_id=%s response_id=%s chars=%s force=%s segment_idx=%s remaining_tokens=%s",
+            "tts_segment_commit stream_id=%s session_id=%s response_id=%s chars=%s force=%s reason=%s segment_idx=%s remaining_tokens=%s",
             self._stream_id,
             self.transport.session_id,
             response.response_id,
             len(segment),
             force,
+            self._segment_reason(segment, force),
             response.tts_segments_sent,
             len(response.pending_tts_tokens),
         )
@@ -552,3 +564,11 @@ class AgentSession:
         segment = "".join(tokens[: end_idx + 1])
         del tokens[: end_idx + 1]
         return segment
+
+    @staticmethod
+    def _segment_reason(segment: str, force: bool) -> str:
+        if force:
+            return "flush"
+        if any(ch in TTS_SEGMENT_PUNCTUATION for ch in segment):
+            return "punctuation"
+        return "length"

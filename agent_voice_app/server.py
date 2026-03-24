@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.agent.session import AgentSession
-from app.audio import b64decode_bytes
+from app.audio import unpack_binary_audio_message
 from app.logging_utils import get_logger
 from app.services.tts_qwen_pool import QwenTTSPool
 from app.transport import BrowserTransport
@@ -68,7 +68,6 @@ async def web() -> FileResponse:
 
 
 @app.websocket("/ws/control")
-@app.websocket("/ws/browser")
 async def control_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     transport = BrowserTransport(websocket)
@@ -77,14 +76,11 @@ async def control_ws(websocket: WebSocket) -> None:
     registry.add(session)
     await transport.send_ready()
     ws_opened_at = time.perf_counter()
-    route = websocket.scope.get("path", "")
-    legacy_mode = route.endswith("/ws/browser")
     logger.info(
-        "browser_session_started stream_id=%s session_id=%s client=%s legacy_mode=%s",
+        "browser_session_started stream_id=%s session_id=%s client=%s",
         transport.stream_id,
         transport.session_id,
         getattr(websocket, "client", None),
-        legacy_mode,
     )
 
     started = False
@@ -120,16 +116,6 @@ async def control_ws(websocket: WebSocket) -> None:
                         exc,
                     )
                     await transport.send_error(f"session start failed: {exc}")
-                continue
-
-            if message_type == "audio":
-                if not legacy_mode:
-                    await transport.send_error("audio must be sent to /ws/uplink")
-                    continue
-                if not started:
-                    await transport.send_error("session not started")
-                    continue
-                await _handle_audio_message(session, data)
                 continue
 
             if message_type == "stop":
@@ -172,11 +158,12 @@ async def uplink_ws(websocket: WebSocket) -> None:
 
     try:
         while True:
-            raw = await websocket.receive_text()
-            data = json.loads(raw)
-            message_type = data.get("type")
-
-            if message_type == "bind":
+            message = await websocket.receive()
+            if "text" in message and message["text"] is not None:
+                data = json.loads(message["text"])
+                if data.get("type") != "bind":
+                    await websocket.send_text(json.dumps({"type": "error", "message": "first uplink message must be bind"}))
+                    continue
                 session_id = str(data.get("session_id") or "")
                 session = registry.get(session_id)
                 if not session:
@@ -191,12 +178,17 @@ async def uplink_ws(websocket: WebSocket) -> None:
                 )
                 continue
 
-            if message_type != "audio":
-                await websocket.send_text(json.dumps({"type": "error", "message": f"unsupported message type: {message_type}"}))
-                continue
-
             if not session:
                 await websocket.send_text(json.dumps({"type": "error", "message": "uplink not bound"}))
+                continue
+
+            raw = message.get("bytes")
+            if raw is None:
+                continue
+
+            header, pcm_bytes = unpack_binary_audio_message(raw)
+            if header.get("type") != "audio_in":
+                await websocket.send_text(json.dumps({"type": "error", "message": "unsupported uplink frame"}))
                 continue
 
             now = time.perf_counter()
@@ -207,7 +199,7 @@ async def uplink_ws(websocket: WebSocket) -> None:
                     stream_id,
                     session_id,
                     (now - opened_at) * 1000,
-                    data.get("seq"),
+                    header.get("seq"),
                 )
             if last_audio_received_at:
                 uplink_gap_ms = (now - last_audio_received_at) * 1000
@@ -217,11 +209,18 @@ async def uplink_ws(websocket: WebSocket) -> None:
                         stream_id,
                         session_id,
                         uplink_gap_ms,
-                        data.get("seq"),
+                        header.get("seq"),
                     )
             last_audio_received_at = now
 
-            await _handle_audio_message(session, data)
+            await session.handle_audio(
+                pcm_bytes,
+                int(header.get("sample_rate", 16000)),
+                captured_at_ms=float(header.get("captured_at_ms", 0.0) or 0.0),
+                received_at_perf=now,
+                received_at_wall_ms=time.time() * 1000,
+                seq=int(header.get("seq", 0) or 0),
+            )
 
     except WebSocketDisconnect:
         logger.info(
@@ -232,21 +231,53 @@ async def uplink_ws(websocket: WebSocket) -> None:
         )
 
 
-async def _handle_audio_message(session: AgentSession, data: dict) -> None:
-    if data.get("encoding") != "pcm16":
-        await session.transport.send_error("audio encoding must be pcm16")
-        return
-    sample_rate = int(data.get("sample_rate", 16000))
-    captured_at_ms = float(data.get("captured_at_ms", 0.0) or 0.0)
-    seq = int(data.get("seq", 0) or 0)
-    pcm_bytes = b64decode_bytes(data.get("audio_b64", ""))
-    received_at_perf = time.perf_counter()
-    received_at_wall_ms = time.time() * 1000
-    await session.handle_audio(
-        pcm_bytes,
-        sample_rate,
-        captured_at_ms=captured_at_ms,
-        received_at_perf=received_at_perf,
-        received_at_wall_ms=received_at_wall_ms,
-        seq=seq,
-    )
+@app.websocket("/ws/downlink-audio")
+async def downlink_audio_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    opened_at = time.perf_counter()
+    session: AgentSession | None = None
+    stream_id = "unknown"
+    session_id = "unknown"
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            if data.get("type") != "bind":
+                await websocket.send_text(json.dumps({"type": "error", "message": "first downlink message must be bind"}))
+                continue
+            session_id = str(data.get("session_id") or "")
+            session = registry.get(session_id)
+            if not session:
+                await websocket.send_text(json.dumps({"type": "error", "message": "unknown session_id"}))
+                continue
+            stream_id = session.transport.stream_id
+            await session.transport.bind_audio_socket(websocket)
+            logger.info(
+                "browser_downlink_audio_connected stream_id=%s session_id=%s elapsed_ms=%.2f",
+                stream_id,
+                session_id,
+                (time.perf_counter() - opened_at) * 1000,
+            )
+            while True:
+                message = await websocket.receive()
+                if "text" in message and message["text"]:
+                    data = json.loads(message["text"])
+                    if data.get("type") == "playback_stop_ack":
+                        logger.info(
+                            "playback_stop_ack stream_id=%s session_id=%s response_id=%s elapsed_ms=%s",
+                            stream_id,
+                            session_id,
+                            data.get("response_id"),
+                            data.get("elapsed_ms"),
+                        )
+                elif message.get("bytes") is not None:
+                    continue
+    except WebSocketDisconnect:
+        if session is not None:
+            session.transport.unbind_audio_socket(websocket)
+        logger.info(
+            "browser downlink audio disconnected stream_id=%s session_id=%s total_elapsed_ms=%.2f",
+            stream_id,
+            session_id,
+            (time.perf_counter() - opened_at) * 1000,
+        )

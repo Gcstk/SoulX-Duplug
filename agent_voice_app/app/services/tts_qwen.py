@@ -9,13 +9,13 @@ from typing import Any, Optional
 
 import websockets
 
-from ..audio import b64decode_bytes, b64encode_bytes
+from ..audio import b64decode_bytes
 from ..logging_utils import get_logger
 
 logger = get_logger("tts")
 
 
-async def _noop_audio(_audio: str) -> None:
+async def _noop_audio(_audio: bytes) -> None:
     return None
 
 
@@ -30,7 +30,7 @@ async def _noop_ready() -> None:
 class QwenTTSService:
     def __init__(
         self,
-        on_audio: Callable[[str], Awaitable[None]] | None = None,
+        on_audio: Callable[[bytes], Awaitable[None]] | None = None,
         on_done: Callable[[], Awaitable[None]] | None = None,
         on_ready: Callable[[], Awaitable[None]] | None = None,
         ws_factory: Callable[..., Awaitable[Any]] | None = None,
@@ -69,7 +69,7 @@ class QwenTTSService:
 
     def bind(
         self,
-        on_audio: Callable[[str], Awaitable[None]],
+        on_audio: Callable[[bytes], Awaitable[None]],
         on_done: Callable[[], Awaitable[None]],
         on_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -176,7 +176,7 @@ class QwenTTSService:
         event_type = data.get("type")
         if event_type == "response.audio.delta":
             logger.debug("tts audio delta bytes_b64=%s elapsed_ms=%.2f", len(data.get("delta", "")), (time.perf_counter() - self._started_at) * 1000)
-            await self._on_audio(b64encode_bytes(b64decode_bytes(data.get("delta", ""))))
+            await self._on_audio(b64decode_bytes(data.get("delta", "")))
             return
         if event_type == "response.done":
             logger.info("tts_done elapsed_ms=%.2f", (time.perf_counter() - self._started_at) * 1000)
