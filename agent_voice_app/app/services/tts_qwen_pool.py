@@ -25,7 +25,7 @@ class QwenTTSPool:
         ttl: float | None = None,
         service_factory: Callable[[], QwenTTSService] = QwenTTSService,
     ):
-        self._pool_size = max(1, pool_size if pool_size is not None else int(os.getenv("TTS_POOL_SIZE", "1")))
+        self._pool_size = max(1, pool_size if pool_size is not None else int(os.getenv("TTS_POOL_SIZE", "4")))
         self._ttl = max(0.1, ttl if ttl is not None else float(os.getenv("TTS_POOL_TTL", "8.0")))
         self._service_factory = service_factory
         self._ready: list[_Entry] = []
