@@ -29,6 +29,9 @@ class ActiveResponse:
     asr_final_wall_ms: float = 0.0
     barge_in_at: float = 0.0
     pending_tts_tokens: list[str] = field(default_factory=list)
+    tts_segment_in_flight: bool = False
+    tts_segments_sent: int = 0
+    tts_segments_done: int = 0
     tts_ready: bool = False
     tts_failed: bool = False
     first_token_logged: bool = False

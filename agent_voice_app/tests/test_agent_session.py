@@ -241,9 +241,60 @@ async def test_tokens_buffer_until_tts_ready_then_flush():
 
     tts.ready_gate.set()
     await session._tts_acquire_task
+    await session._on_llm_done()
 
     assert response.pending_tts_tokens == []
-    assert tts.sent == ["你", "好"]
+    assert tts.sent == ["你好"]
+
+
+@pytest.mark.asyncio
+async def test_tts_segment_commits_on_punctuation():
+    transport = FakeTransport()
+    pool = FakePool(FakeTTS)
+    session = AgentSession(
+        transport=transport,
+        duplug_client_factory=FakeDuplug,
+        llm_factory=FakeLLM,
+        tts_factory=FakeTTS,
+        tts_pool=pool,
+    )
+
+    await session.start()
+    await session._on_user_turn_final("你好")
+
+    while session._tts is None:
+        await asyncio.sleep(0)
+
+    await session._on_llm_token("你好")
+    await session._on_llm_token("，")
+
+    assert session._tts.sent == ["你好，"]
+    assert session.state.active_response.pending_tts_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_tts_segment_commits_after_ten_chars_without_punctuation():
+    transport = FakeTransport()
+    pool = FakePool(FakeTTS)
+    session = AgentSession(
+        transport=transport,
+        duplug_client_factory=FakeDuplug,
+        llm_factory=FakeLLM,
+        tts_factory=FakeTTS,
+        tts_pool=pool,
+    )
+
+    await session.start()
+    await session._on_user_turn_final("你好")
+
+    while session._tts is None:
+        await asyncio.sleep(0)
+
+    for token in ["一二三", "四五六", "七八九十"]:
+        await session._on_llm_token(token)
+
+    assert session._tts.sent == ["一二三四五六七八九十"]
+    assert session.state.active_response.pending_tts_tokens == []
 
 
 @pytest.mark.asyncio
@@ -260,6 +311,8 @@ async def test_complete_metrics_include_pool_fields():
 
     await session.start()
     await session._on_user_turn_final("你好")
+    while session._tts is None:
+        await asyncio.sleep(0)
     response_id = session.state.active_response.response_id
     await session._on_llm_token("好")
     await session._on_llm_done()

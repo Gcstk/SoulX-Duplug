@@ -14,6 +14,8 @@ from ..transport import BrowserTransport
 from ..types import ActiveResponse, Phase, SessionState
 
 logger = get_logger("session")
+TTS_SEGMENT_MIN_CHARS = 10
+TTS_SEGMENT_PUNCTUATION = "。！？!?；;，,\n"
 
 
 class AgentSession:
@@ -340,12 +342,7 @@ class AgentSession:
             (response.tts_ready_at - response.response_started_at) * 1000,
             len(response.pending_tts_tokens),
         )
-        pending = list(response.pending_tts_tokens)
-        response.pending_tts_tokens.clear()
-        for token in pending:
-            await self._tts.send(token)
-        if response.llm_done:
-            await self._tts.flush()
+        await self._maybe_send_tts_segment(response, force=response.llm_done)
 
     async def _on_llm_token(self, token: str) -> None:
         response = self.state.active_response
@@ -372,10 +369,9 @@ class AgentSession:
             len(response.assistant_text),
         )
         await self.transport.send_transcript("assistant", response.assistant_text, False, response.response_id)
+        response.pending_tts_tokens.append(token)
         if response.tts_ready and self._tts:
-            await self._tts.send(token)
-        else:
-            response.pending_tts_tokens.append(token)
+            await self._maybe_send_tts_segment(response, force=False)
 
     async def _on_llm_done(self) -> None:
         response = self.state.active_response
@@ -391,7 +387,7 @@ class AgentSession:
             len(response.assistant_text),
         )
         if response.tts_ready and self._tts:
-            await self._tts.flush()
+            await self._maybe_send_tts_segment(response, force=True)
         elif response.tts_failed:
             await self._finish_response_if_ready(response.response_id)
 
@@ -424,13 +420,20 @@ class AgentSession:
         if not response or response.cancelled or response.response_id != response_id:
             return
         response.tts_done = True
+        response.tts_segments_done += 1
+        response.tts_segment_in_flight = False
         logger.info(
-            "tts_done stream_id=%s session_id=%s response_id=%s elapsed_ms=%.2f",
+            "tts_done stream_id=%s session_id=%s response_id=%s elapsed_ms=%.2f segment_done=%s segment_sent=%s pending_tokens=%s",
             self._stream_id,
             self.transport.session_id,
             response_id,
             (time.perf_counter() - response.response_started_at) * 1000,
+            response.tts_segments_done,
+            response.tts_segments_sent,
+            len(response.pending_tts_tokens),
         )
+        if response.pending_tts_tokens:
+            await self._maybe_send_tts_segment(response, force=response.llm_done)
         await self._finish_response_if_ready(response_id)
 
     async def _finish_response_if_ready(self, response_id: str) -> None:
@@ -439,8 +442,15 @@ class AgentSession:
             return
         if not response.llm_done:
             return
-        if not response.tts_done and not response.tts_failed:
-            return
+        if not response.tts_failed:
+            if response.pending_tts_tokens:
+                return
+            if response.tts_segments_sent == 0 and response.assistant_text:
+                return
+            if response.tts_segments_done < response.tts_segments_sent:
+                return
+            if response.tts_segment_in_flight:
+                return
 
         await self.transport.send_transcript("assistant", response.assistant_text, True, response_id)
 
@@ -492,3 +502,53 @@ class AgentSession:
         if value is None:
             return None
         return round(value, 2)
+
+    async def _maybe_send_tts_segment(self, response: ActiveResponse, *, force: bool) -> None:
+        if not response.tts_ready or not self._tts or response.cancelled or response.tts_segment_in_flight:
+            return
+        segment = self._drain_tts_segment(response.pending_tts_tokens, force=force)
+        if not segment:
+            return
+        response.tts_segment_in_flight = True
+        response.tts_done = False
+        response.tts_segments_sent += 1
+        logger.info(
+            "tts_segment_commit stream_id=%s session_id=%s response_id=%s chars=%s force=%s segment_idx=%s remaining_tokens=%s",
+            self._stream_id,
+            self.transport.session_id,
+            response.response_id,
+            len(segment),
+            force,
+            response.tts_segments_sent,
+            len(response.pending_tts_tokens),
+        )
+        await self._tts.send(segment)
+        await self._tts.flush()
+
+    @staticmethod
+    def _drain_tts_segment(tokens: list[str], *, force: bool) -> str:
+        if not tokens:
+            return ""
+        if force:
+            segment = "".join(tokens)
+            tokens.clear()
+            return segment
+
+        char_count = 0
+        end_idx = -1
+        for idx, token in enumerate(tokens):
+            token_chars = len(token)
+            char_count += token_chars
+            if any(ch in TTS_SEGMENT_PUNCTUATION for ch in token):
+                end_idx = idx
+                break
+            if char_count >= TTS_SEGMENT_MIN_CHARS:
+                end_idx = idx
+                break
+
+        if end_idx < 0:
+            return ""
+
+        segment = "".join(tokens[: end_idx + 1])
+        del tokens[: end_idx + 1]
+        return segment
