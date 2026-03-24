@@ -49,6 +49,7 @@ class BrowserTransport:
         self._queue_peaks = {P0_CONTROL: 0, P1_TRANSCRIPT: 0, P2_MEDIA: 0}
         self._stale_media_dropped = 0
         self._last_clear_sent_at = 0.0
+        self._last_turn_event: tuple[str, str] | None = None
 
     async def start(self) -> None:
         if self._running:
@@ -82,6 +83,10 @@ class BrowserTransport:
         await self._enqueue_and_wait({"type": "phase", "phase": phase.value}, P0_CONTROL)
 
     async def send_turn_event(self, kind: str, text: str = "") -> None:
+        signature = (kind, text if kind == "complete" else "")
+        if self._last_turn_event == signature:
+            return
+        self._last_turn_event = signature
         await self._enqueue_and_wait({"type": "turn_event", "kind": kind, "text": text}, P0_CONTROL)
 
     async def send_transcript(

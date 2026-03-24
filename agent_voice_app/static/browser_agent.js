@@ -12,7 +12,7 @@ const debugState = document.getElementById("debugState");
 const metricsState = document.getElementById("metricsState");
 
 const state = {
-  assetVersion: "20260324b",
+  assetVersion: "20260324c",
   controlWs: null,
   uplinkWs: null,
   streamId: null,
@@ -27,6 +27,13 @@ const state = {
   activeResponseId: null,
   started: false,
   uplinkBound: false,
+  renderTimer: null,
+  pendingDebugPayload: null,
+  pendingMetricsPayload: null,
+  liveText: {
+    user: "...",
+    assistant: "...",
+  },
 };
 
 function controlWsUrl() {
@@ -56,6 +63,25 @@ function resetLiveCard(target) {
   target.textContent = "...";
 }
 
+function scheduleRender() {
+  if (state.renderTimer !== null) {
+    return;
+  }
+  state.renderTimer = window.setTimeout(() => {
+    state.renderTimer = null;
+    userLive.textContent = state.liveText.user || "...";
+    assistantLive.textContent = state.liveText.assistant || "...";
+    if (state.pendingDebugPayload) {
+      debugState.textContent = JSON.stringify(state.pendingDebugPayload, null, 2);
+      state.pendingDebugPayload = null;
+    }
+    if (state.pendingMetricsPayload) {
+      metricsState.textContent = JSON.stringify(state.pendingMetricsPayload, null, 2);
+      state.pendingMetricsPayload = null;
+    }
+  }, 120);
+}
+
 function appendBubble(speaker, text) {
   if (!text.trim()) {
     return;
@@ -73,6 +99,10 @@ function clearTranscript() {
   resetLiveCard(assistantLive);
   debugState.textContent = "waiting for /turn events...";
   metricsState.textContent = "waiting for response metrics...";
+  state.liveText.user = "...";
+  state.liveText.assistant = "...";
+  state.pendingDebugPayload = null;
+  state.pendingMetricsPayload = null;
 }
 
 function float32ToBase64Pcm16(floatBuffer) {
@@ -142,6 +172,7 @@ function clearPlayback() {
 async function shutdownAudioPipeline() {
   clearPlayback();
   if (state.workletNode) {
+    state.workletNode.port.postMessage({ type: "stop" });
     state.workletNode.port.onmessage = null;
     state.workletNode.disconnect();
   }
@@ -203,7 +234,6 @@ function sendUplinkAudio(payload) {
   if (!state.uplinkWs || state.uplinkWs.readyState !== WebSocket.OPEN || !state.started || !state.uplinkBound) {
     return;
   }
-  const wsSendStartedAt = performance.now();
   state.uplinkWs.send(JSON.stringify({
     type: "audio",
     encoding: "pcm16",
@@ -213,10 +243,9 @@ function sendUplinkAudio(payload) {
     captured_at_ms: payload.captured_at_ms,
     audio_b64: float32ToBase64Pcm16(payload.samples),
   }));
-  const captureToSendMs = performance.now() - wsSendStartedAt;
   const bufferedAmount = state.uplinkWs.bufferedAmount;
   if (bufferedAmount > 65536) {
-    console.debug("uplink buffered", { bufferedAmount, seq: payload.seq, captureToSendMs });
+    console.debug("uplink buffered", { bufferedAmount, seq: payload.seq });
   }
 }
 
@@ -267,6 +296,7 @@ async function connect() {
       state.playbackClock = state.audioContext.currentTime;
       setStatus(socketState, "control+uplink");
       ws.send(JSON.stringify({ type: "start", sample_rate: state.browserSampleRate }));
+      state.workletNode.port.postMessage({ type: "start" });
       return;
     }
     if (message.type === "phase") {
@@ -274,8 +304,8 @@ async function connect() {
       return;
     }
     if (message.type === "transcript") {
-      const liveTarget = message.speaker === "user" ? userLive : assistantLive;
-      liveTarget.textContent = message.text || "...";
+      state.liveText[message.speaker] = message.text || "...";
+      scheduleRender();
       if (message.final) {
         appendBubble(message.speaker, message.text);
       }
@@ -290,15 +320,18 @@ async function connect() {
     }
     if (message.type === "clear_audio") {
       clearPlayback();
-      assistantLive.textContent = "...";
+      state.liveText.assistant = "...";
+      scheduleRender();
       return;
     }
     if (message.type === "turn_debug") {
-      debugState.textContent = JSON.stringify(message.payload, null, 2);
+      state.pendingDebugPayload = message.payload;
+      scheduleRender();
       return;
     }
     if (message.type === "metrics") {
-      metricsState.textContent = JSON.stringify(message.payload, null, 2);
+      state.pendingMetricsPayload = message.payload;
+      scheduleRender();
       return;
     }
     if (message.type === "error") {

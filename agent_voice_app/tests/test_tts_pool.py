@@ -1,6 +1,9 @@
+import asyncio
+import time
+
 import pytest
 
-from app.services.tts_qwen_pool import QwenTTSPool
+from app.services.tts_qwen_pool import QwenTTSPool, _Entry
 
 
 class FakePooledTTS:
@@ -32,6 +35,18 @@ class FakePooledTTS:
 
     def bind(self, on_audio, on_done, on_ready=None):
         self.bound += 1
+
+
+class SlowCancelTTS(FakePooledTTS):
+    def __init__(self):
+        super().__init__()
+        self.cancel_gate = None
+
+    async def cancel(self):
+        self.cancelled += 1
+        self.running = False
+        self.cancel_gate = self.cancel_gate or asyncio.Event()
+        await self.cancel_gate.wait()
 
 
 @pytest.mark.asyncio
@@ -70,4 +85,29 @@ async def test_tts_pool_release_refills():
     tts, _ = await pool.get()
     await pool.release(tts, broken=False)
     assert pool.available >= 1
+    await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_tts_pool_get_skips_stale_without_blocking_on_cancel():
+    stale = SlowCancelTTS()
+    stale.running = True
+    healthy = FakePooledTTS()
+    healthy.running = True
+
+    pool = QwenTTSPool(pool_size=1, ttl=8.0, service_factory=FakePooledTTS)
+    pool._running = True
+    pool._ready = [
+        _Entry(tts=stale, idle_since=time.monotonic() - 9.0),
+        _Entry(tts=healthy, idle_since=time.monotonic()),
+    ]
+
+    returned, hit = await asyncio.wait_for(pool.get(), timeout=0.1)
+
+    assert hit is True
+    assert returned is healthy
+    await asyncio.sleep(0)
+    assert stale.cancelled == 1
+    assert stale.cancel_gate is not None
+    stale.cancel_gate.set()
     await pool.stop()

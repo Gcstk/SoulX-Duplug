@@ -50,3 +50,20 @@ async def test_invalidate_response_drops_stale_media():
     await transcript_task
     assert websocket.sent == []
     assert transport.queue_metrics()["stale_media_dropped_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_turn_event_is_suppressed():
+    websocket = FakeWebSocket()
+    transport = BrowserTransport(websocket)
+    await transport.start()
+
+    await transport.send_turn_event("idle")
+    await transport.send_turn_event("idle")
+    await transport.send_turn_event("nonidle")
+    await transport.stop()
+
+    sent_types = [item["type"] for item in websocket.sent]
+    turn_events = [item for item in websocket.sent if item["type"] == "turn_event"]
+    assert sent_types == ["turn_event", "turn_event"]
+    assert [item["kind"] for item in turn_events] == ["idle", "nonidle"]

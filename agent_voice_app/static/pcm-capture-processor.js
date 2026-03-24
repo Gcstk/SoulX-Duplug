@@ -5,8 +5,19 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.pending = [];
     this.contextBaseWallMs = 0;
     this.seq = 0;
+    this.enabled = false;
     this.port.onmessage = (event) => {
       const payload = event.data || {};
+      if (payload.type === "start") {
+        this.enabled = true;
+        this.pending = [];
+        return;
+      }
+      if (payload.type === "stop") {
+        this.enabled = false;
+        this.pending = [];
+        return;
+      }
       if (payload.type !== "config") {
         return;
       }
@@ -20,6 +31,9 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (!this.enabled) {
+      return true;
+    }
     const input = inputs[0];
     if (!input || !input[0]) {
       return true;

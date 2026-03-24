@@ -25,13 +25,15 @@ class QwenTTSPool:
         ttl: float | None = None,
         service_factory: Callable[[], QwenTTSService] = QwenTTSService,
     ):
-        self._pool_size = max(1, pool_size if pool_size is not None else int(os.getenv("TTS_POOL_SIZE", "4")))
-        self._ttl = max(0.1, ttl if ttl is not None else float(os.getenv("TTS_POOL_TTL", "12.0")))
+        configured_pool_size = pool_size if pool_size is not None else int(os.getenv("TTS_POOL_SIZE", "1"))
+        self._pool_size = 1 if configured_pool_size > 1 else max(1, configured_pool_size)
+        self._ttl = max(0.1, ttl if ttl is not None else float(os.getenv("TTS_POOL_TTL", "45.0")))
         self._service_factory = service_factory
         self._ready: list[_Entry] = []
         self._running = False
         self._fill_task: asyncio.Task | None = None
         self._fill_event = asyncio.Event()
+        self._cleanup_tasks: set[asyncio.Task] = set()
         self.pool_hit = 0
         self.pool_miss = 0
         self.warmup_count = 0
@@ -58,11 +60,21 @@ class QwenTTSPool:
             except asyncio.CancelledError:
                 pass
             self._fill_task = None
+        cleanup_tasks = list(self._cleanup_tasks)
+        for task in cleanup_tasks:
+            task.cancel()
+        for task in cleanup_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._cleanup_tasks.clear()
         for entry in self._ready:
             await entry.tts.cancel()
         self._ready.clear()
 
     async def get(self) -> tuple[QwenTTSService, bool]:
+        stale_entries: list[_Entry] = []
         while self._ready:
             entry = self._ready.pop(0)
             age = time.monotonic() - entry.idle_since
@@ -70,9 +82,13 @@ class QwenTTSPool:
                 self.pool_hit += 1
                 logger.info("tts_pool_hit available=%s idle_ms=%s", len(self._ready), int(age * 1000))
                 self._trigger_fill()
+                if stale_entries:
+                    self._cancel_stale_entries(stale_entries)
                 return entry.tts, True
-            logger.info("tts_pool_evict_stale idle_ms=%s", int(age * 1000))
-            await entry.tts.cancel()
+            stale_entries.append(entry)
+
+        if stale_entries:
+            self._cancel_stale_entries(stale_entries)
 
         self.pool_miss += 1
         logger.info("tts_pool_miss available=0")
@@ -95,6 +111,14 @@ class QwenTTSPool:
 
     def _trigger_fill(self) -> None:
         self._fill_event.set()
+
+    def _cancel_stale_entries(self, entries: list[_Entry]) -> None:
+        for entry in entries:
+            age_ms = int((time.monotonic() - entry.idle_since) * 1000)
+            logger.info("tts_pool_evict_stale idle_ms=%s", age_ms)
+            task = asyncio.create_task(entry.tts.cancel())
+            self._cleanup_tasks.add(task)
+            task.add_done_callback(self._cleanup_tasks.discard)
 
     async def _fill_loop(self) -> None:
         try:
