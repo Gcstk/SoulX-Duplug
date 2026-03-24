@@ -6,7 +6,9 @@ import asyncio
 
 import pytest
 
-from app.services.llm import LLMService
+from agent_voice_app.app.services.llm import LLMService
+
+# from app.services.llm import LLMService
 
 
 pytestmark = pytest.mark.integration
@@ -17,7 +19,10 @@ def _missing_env() -> list[str]:
     missing = [name for name in required if not os.getenv(name)]
     return missing
 
-
+os.environ["RUN_LLM_INTEGRATION"] = "1"
+os.environ["LLM_API_KEY"] = "sk-geotk"
+os.environ["LLM_MODEL"] = "qwen-4b-character"
+os.environ["LLM_BASE_URL"] = "http://115.190.220.21:80/v1"
 @pytest.mark.asyncio
 async def test_llm_real_latency_smoke():
     if os.getenv("RUN_LLM_INTEGRATION") != "1":
