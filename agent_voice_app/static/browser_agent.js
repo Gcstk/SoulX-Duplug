@@ -12,7 +12,7 @@ const debugState = document.getElementById("debugState");
 const metricsState = document.getElementById("metricsState");
 
 const state = {
-  assetVersion: "20260324d",
+  assetVersion: "20260324e",
   controlWs: null,
   uplinkWs: null,
   audioWs: null,
@@ -25,6 +25,8 @@ const state = {
   browserSampleRate: 16000,
   playbackClock: 0,
   playbackNodes: new Set(),
+  playerFrames: [],
+  playerTask: null,
   activeResponseId: null,
   started: false,
   uplinkBound: false,
@@ -40,6 +42,9 @@ const state = {
 const UPLINK_FRAME_MS = 40;
 const MAX_UPLINK_BUFFER = 65536;
 const MAX_PLAYBACK_BUFFER_MS = 200;
+const PLAYER_FRAME_MS = 20;
+const PLAYER_IDLE_WAIT_MS = 10;
+const PLAYER_LEAD_MS = 40;
 
 function wsUrl(path) {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -130,7 +135,17 @@ function base64ToInt16(base64) {
   return new Int16Array(bytes.buffer);
 }
 
-function playPcmChunk(pcmBuffer, sampleRate, responseId, generatedAtMs) {
+function splitPcmFrames(pcmBuffer, sampleRate, frameMs) {
+  const bytesPerFrame = Math.max(2, Math.round((sampleRate * frameMs) / 1000) * 2);
+  const frames = [];
+  const bytes = new Uint8Array(pcmBuffer);
+  for (let offset = 0; offset < bytes.length; offset += bytesPerFrame) {
+    frames.push(bytes.slice(offset, Math.min(offset + bytesPerFrame, bytes.length)).buffer);
+  }
+  return frames;
+}
+
+function queuePcmChunk(pcmBuffer, sampleRate, responseId, generatedAtMs) {
   if (!state.audioContext) {
     return;
   }
@@ -138,8 +153,35 @@ function playPcmChunk(pcmBuffer, sampleRate, responseId, generatedAtMs) {
     return;
   }
   state.activeResponseId = responseId;
-  const samples = new Int16Array(pcmBuffer);
-  const buffer = state.audioContext.createBuffer(1, samples.length, sampleRate);
+  const queuedMs = state.playerFrames.length * PLAYER_FRAME_MS;
+  if (queuedMs > MAX_PLAYBACK_BUFFER_MS) {
+    console.debug("drop tts chunk due to deep buffer", { queuedMs, responseId });
+    return;
+  }
+  const frames = splitPcmFrames(pcmBuffer, sampleRate, PLAYER_FRAME_MS);
+  for (const frame of frames) {
+    state.playerFrames.push({
+      pcmBuffer: frame,
+      sampleRate,
+      responseId,
+      generatedAtMs,
+    });
+  }
+  if (generatedAtMs) {
+    state.pendingMetricsPayload = {
+      ...(state.pendingMetricsPayload || {}),
+      downlink_audio_buffer_ms: Math.round(state.playerFrames.length * PLAYER_FRAME_MS),
+      audio_chunk_age_ms: Math.round(Date.now() - generatedAtMs),
+      queued_audio_chunks: state.playerFrames.length,
+    };
+    scheduleRender();
+  }
+  ensurePlaybackLoop();
+}
+
+function scheduleFrame(frame) {
+  const samples = new Int16Array(frame.pcmBuffer);
+  const buffer = state.audioContext.createBuffer(1, samples.length, frame.sampleRate);
   const channel = buffer.getChannelData(0);
   for (let i = 0; i < samples.length; i += 1) {
     channel[i] = samples[i] / 0x7fff;
@@ -148,33 +190,45 @@ function playPcmChunk(pcmBuffer, sampleRate, responseId, generatedAtMs) {
   source.buffer = buffer;
   source.connect(state.audioContext.destination);
   const now = state.audioContext.currentTime;
-  const queuedMs = Math.max(0, (state.playbackClock - now) * 1000);
-  if (queuedMs > MAX_PLAYBACK_BUFFER_MS) {
-    // Prefer dropping stale media over deepening the playback tail, because
-    // barge-in correctness matters more than perfect continuity in this app.
-    console.debug("drop tts chunk due to deep buffer", { queuedMs, responseId });
-    return;
-  }
-  state.playbackClock = Math.max(state.playbackClock, now);
+  const leadSeconds = PLAYER_LEAD_MS / 1000;
+  state.playbackClock = Math.max(state.playbackClock, now + leadSeconds);
   source.start(state.playbackClock);
   state.playbackClock += buffer.duration;
   source.onended = () => state.playbackNodes.delete(source);
   state.playbackNodes.add(source);
   setStatus(playbackState, "streaming");
-  if (generatedAtMs) {
-    state.pendingMetricsPayload = {
-      ...(state.pendingMetricsPayload || {}),
-      downlink_audio_buffer_ms: Math.round(queuedMs),
-      audio_chunk_age_ms: Math.round(Date.now() - generatedAtMs),
-      queued_audio_chunks: state.playbackNodes.size,
-    };
-    scheduleRender();
+}
+
+function ensurePlaybackLoop() {
+  if (state.playerTask) {
+    return;
   }
+  state.playerTask = window.setInterval(() => {
+    if (!state.audioContext) {
+      return;
+    }
+    if (!state.playerFrames.length) {
+      if (state.playbackNodes.size === 0) {
+        setStatus(playbackState, "idle");
+      }
+      return;
+    }
+    const queuedMs = Math.max(0, (state.playbackClock - state.audioContext.currentTime) * 1000);
+    if (queuedMs > PLAYER_LEAD_MS + PLAYER_FRAME_MS) {
+      return;
+    }
+    const frame = state.playerFrames.shift();
+    if (!frame) {
+      return;
+    }
+    scheduleFrame(frame);
+  }, PLAYER_IDLE_WAIT_MS);
 }
 
 function clearPlayback() {
   state.playbackAckStartedAt = performance.now();
   state.playbackClock = state.audioContext ? state.audioContext.currentTime : 0;
+  state.playerFrames = [];
   for (const node of state.playbackNodes) {
     try {
       node.stop();
@@ -195,6 +249,10 @@ function clearPlayback() {
 
 async function shutdownAudioPipeline() {
   clearPlayback();
+  if (state.playerTask !== null) {
+    clearInterval(state.playerTask);
+    state.playerTask = null;
+  }
   if (state.workletNode) {
     state.workletNode.port.postMessage({ type: "stop" });
     state.workletNode.port.onmessage = null;
@@ -320,7 +378,7 @@ async function openAudioSocket() {
       }
       const { header, payload } = unpackAudioFrame(event.data);
       if (header.type === "tts_chunk") {
-        playPcmChunk(payload, header.sample_rate, header.response_id, header.generated_at_ms);
+        queuePcmChunk(payload, header.sample_rate, header.response_id, header.generated_at_ms);
       }
     };
     ws.onerror = () => reject(new Error("downlink audio websocket failed"));
